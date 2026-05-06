@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# data
+data/
+
+# ray
+prometheus*/
+checkpoints/
+
+notebooks/
+
+animations/*
+*.err
+*.o
+configs/legacy/*
+results/
