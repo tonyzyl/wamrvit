@@ -20,7 +20,12 @@ import torch
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.dataloader.transform import apply_transform_src, inverse_transform_src
 from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid, regrid_native
+from wamrvit.quad.adapt_wavelet import regrid_native
+from wamrvit.quad.regrid_dispatch import (
+    regrid_native_dispatch,
+    regrid_uniform_dispatch,
+    RegridProfiler,
+)
 from wamrvit.quad.quad_utils import (
     quadtree_to_tensor,
     tensor_to_quadtree,
@@ -264,6 +269,13 @@ class AdaptivePredictor:
             )
             self.regrid_tol_frac = self.tol_frac
 
+        self.regrid_backend = inf_cfg.get("regrid_backend", "object")
+        # Profiling is opt-in (regrid_profile): default object rollouts stay
+        # side-effect-free -- no timing CSVs written. Active only for a comparison run.
+        self.regrid_profiler = RegridProfiler() if inf_cfg.get("regrid_profile", False) else None
+        _out_csv = inf_cfg.get("output_csv")
+        self.regrid_out_dir = os.path.dirname(_out_csv) if _out_csv else os.getcwd()
+
         if (
             self.regrid_interval is not None
             and self.regrid_interval % self.model_return_seq_len != 0
@@ -350,6 +362,8 @@ class AdaptivePredictor:
         all_centers = []  # list[(N, 3)]
         all_levels = []  # list[(N,)]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.new_sample()
         with torch.no_grad():
             for call_idx in range(self.num_forward_calls):
                 timestep_idx = call_idx * R
@@ -370,28 +384,23 @@ class AdaptivePredictor:
                             .cpu()
                             .numpy()
                         )
-                        qt = tensor_to_quadtree(
-                            flat_input, meta, cell_scale_mode=self.cell_scale_mode
-                        )
-
                         ch_offset = (t_in - 1) * c_in
                         use_channels = (
                             [ch + ch_offset for ch in self.adapt_on_channels]
                             if self.adapt_on_channels is not None
                             else list(range(ch_offset, t_in * c_in))
                         )
-                        regrid(
-                            qt,
+                        new_input_np, meta = regrid_uniform_dispatch(
+                            flat_input,
+                            meta,
+                            backend=self.regrid_backend,
+                            profiler=self.regrid_profiler,
+                            max_passes=10,
+                            cell_scale_mode=self.cell_scale_mode,
                             tol_frac=self.regrid_tol_frac,
                             channel=use_channels,
-                            max_passes=10,
                             adapt_nearby=self.regrid_adapt_nearby,
                             allow_coarsening=self.allow_coarsening,
-                            disable_warnings=True,
-                        )
-
-                        new_input_np, meta = quadtree_to_tensor(
-                            qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
                         )
                         centers = torch.from_numpy(meta["centers"]).to(
                             self.device, dtype=torch.float32
@@ -475,6 +484,8 @@ class AdaptivePredictor:
             if key in batch:
                 out[key] = batch[key]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
         return out
 
     def _call_native(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -517,6 +528,8 @@ class AdaptivePredictor:
         all_centers = []
         all_levels = []
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.new_sample()
         with torch.no_grad():
             for call_idx in range(self.num_forward_calls):
                 timestep_idx = call_idx * R
@@ -534,10 +547,12 @@ class AdaptivePredictor:
                                 C_orig, T_in_val = arr.shape[1], arr.shape[2]
                                 break
                         np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
-                        new_np, new_l2b, meta = regrid_native(
+                        new_np, new_l2b, meta = regrid_native_dispatch(
                             np_by_level,
                             leaf_to_bucket.cpu().numpy(),
                             meta,
+                            backend=self.regrid_backend,
+                            profiler=self.regrid_profiler,
                             C=C_orig,
                             T=T_in_val,
                             tol_frac=self.regrid_tol_frac,
@@ -631,6 +646,8 @@ class AdaptivePredictor:
             if key in batch:
                 out[key] = batch[key]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
         return out
 
 

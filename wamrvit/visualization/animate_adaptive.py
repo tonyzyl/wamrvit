@@ -11,9 +11,8 @@ import torch
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid, regrid_native
+from wamrvit.quad.regrid_dispatch import regrid_native_dispatch, regrid_uniform_dispatch
 from wamrvit.quad.quad_utils import (
-    quadtree_to_tensor,
     tensor_to_quadtree,
     tensor_to_quadtree_native,
     tensor_to_uniform,
@@ -21,6 +20,7 @@ from wamrvit.quad.quad_utils import (
 )
 from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
+from wamrvit.visualization import anim_style
 from wamrvit.visualization.plotting import compute_vrange, plot_quadtree
 
 
@@ -281,6 +281,8 @@ def save_single_gif(
     source_centers=None,
     source_levels=None,
     remap_mode: str = "uniform",
+    show_axes: bool = True,
+    aspect: float = 1.0,
 ):
     """Renders the sequence to a GIF, handling dynamically changing grids."""
     if vmin is None:
@@ -288,11 +290,12 @@ def save_single_gif(
     if vmax is None:
         vmax = float(np.max(seq))
 
-    fig = plt.figure(figsize=(6, 6), dpi=dpi)
+    _figsize, _ax_rect, _cax_rect = anim_style.compute_layout(aspect, show_axes=show_axes)
+    fig = plt.figure(figsize=_figsize, dpi=dpi)
 
     def update(frame):
         fig.clf()
-        ax = fig.add_subplot(111)
+        ax, cax = anim_style.make_aligned_axes(fig, _ax_rect, _cax_rect)
         ax.grid(False)
 
         # Extract frame data and corresponding dynamic grid metadata
@@ -323,6 +326,7 @@ def save_single_gif(
             channel=0,
             outline_width=outline_width,
             colorbar=True,
+            cax=cax,
             vmin=vmin,
             vmax=vmax,
             draw_outlines=draw_outlines,
@@ -331,11 +335,12 @@ def save_single_gif(
             max_pixels=max_pixels if max_pixels is not None else 2048,
         )
 
-        ax.set_title(f"{title_prefix} (Frame {frame})", fontsize=16, pad=15)
+        anim_style.finalize_axes(
+            ax, title=f"{title_prefix} (Frame {frame})", show_axes=show_axes
+        )
         return []
 
     anim = animation.FuncAnimation(fig, update, frames=T, blit=False)
-    fig.tight_layout()
     anim.save(filename, writer="pillow", fps=fps, dpi=dpi)
     plt.close(fig)
 
@@ -362,6 +367,7 @@ def _animate_native(
     model_name,
     data_config,
     outline_width,
+    gt_grid_mode: str = "adaptive",
     draw_outlines,
     x_frac,
     y_frac,
@@ -371,6 +377,8 @@ def _animate_native(
     save_at_indices,
 ):
     """Native-mode animation: uses tensor_to_uniform_native + imshow."""
+
+    show_axes = anim_cfg.get("show_axes", True)
 
     def _unpack(arr):
         return arr[0] if arr.dtype == object else arr
@@ -395,6 +403,15 @@ def _animate_native(
     ref_meta = {"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain}
     meta = ref_meta
 
+    native_aspect = anim_style.resolve_aspect(
+        domain["ymax"] - domain["ymin"], domain["xmax"] - domain["xmin"],
+        x_frac=x_frac, y_frac=y_frac, override=anim_cfg.get("data_aspect"),
+    )
+    native_figsize, native_ax_rect, native_cax_rect = anim_style.compute_layout(
+        native_aspect, show_axes=show_axes
+    )
+    print(f"[layout] native: data aspect H/W = {native_aspect:.4f}")
+
     R = model.config.return_seq_len
     T_in = next(v.shape[2] for v in inputs_by_level.values() if v.shape[0] > 0)
     num_forward_calls = math.ceil(predict_steps / R)
@@ -407,6 +424,7 @@ def _animate_native(
     all_levels = []
 
     allow_coarsening = config["inference"].get("allow_coarsening", True)
+    regrid_backend = config["inference"].get("regrid_backend", "object")
 
     print(
         f"\nStarting native inference (Steps: {predict_steps}, "
@@ -431,10 +449,11 @@ def _animate_native(
                         break
                 n_leaves_before = int(leaf_to_bucket.shape[0])
                 np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
-                new_np, new_l2b, meta = regrid_native(
+                new_np, new_l2b, meta = regrid_native_dispatch(
                     np_by_level,
                     leaf_to_bucket.cpu().numpy(),
                     meta,
+                    backend=regrid_backend,
                     C=C_orig,
                     T=T_orig,
                     tol_frac=regrid_tol_frac,
@@ -515,6 +534,11 @@ def _animate_native(
         gt_base_filename = os.path.join(
             anim_dir, f"GT_{field}_traj{args.traj_idx}_frame{args.frame_idx}"
         )
+        # Title prefixes: omit the "name: " segment when the display name is
+        # empty, matching animate_regular.py so an empty name yields just the
+        # field (no leading ": ").
+        gt_gif_prefix = f"{args.gt_display_name}: {field}" if args.gt_display_name else field
+        pred_gif_prefix = f"{args.display_name}: {field}" if args.display_name else field
 
         # Compute global value range via flat uniform reconstruction (cheap).
         gt_vals = []
@@ -541,90 +565,126 @@ def _animate_native(
             anim_cfg,
         )
 
-        # --- GT GIF (quadtree overlay via plot_quadtree) ---
-        fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-
-        def _update_gt(frame, fig=fig, c_idx=c_idx):
-            fig.clf()
-            ax = fig.add_subplot(111)
-            ax.grid(False)
-            gt_frame = {lvl: arr[:, c_idx : c_idx + 1, frame] for lvl, arr in gt_by_level.items()}
-            qt = tensor_to_quadtree_native(
-                gt_frame, ref_l2b, ref_meta, cell_scale_mode=cell_scale_mode
-            )
-            plot_quadtree(
-                qt,
-                ax=ax,
-                channel=0,
-                outline_width=outline_width,
-                colorbar=True,
-                vmin=vmin_global,
-                vmax=vmax_global,
-                draw_outlines=draw_outlines,
-                max_pixels=max_pixels if max_pixels is not None else 2048,
-                x_frac=x_frac,
-                y_frac=y_frac,
-            )
-            ax.set_title(f"Physics simulation: {field} (Frame {frame})", fontsize=14)
-            return []
-
-        anim_gt = animation.FuncAnimation(
-            fig, _update_gt, frames=min(predict_steps, T_gt), blit=False
-        )
-        fig.tight_layout()
-        anim_gt.save(f"{gt_base_filename}.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
-        plt.close(fig)
-
-        # --- Prediction GIF (quadtree overlay via plot_quadtree) ---
-        fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-
-        def _update_pred(frame, fig=fig, c_idx=c_idx):
-            fig.clf()
-            ax = fig.add_subplot(111)
-            ax.grid(False)
-            p = all_preds_by_level[frame]
-            pred_frame = {lvl: arr[:, c_idx : c_idx + 1, 0] for lvl, arr in p.items()}
-            step_meta = {
-                "centers": all_centers[frame],
-                "levels": all_levels[frame],
-                "domain": domain,
-            }
-            qt = tensor_to_quadtree_native(
-                pred_frame, all_leaf_to_bucket[frame], step_meta, cell_scale_mode=cell_scale_mode
-            )
-            plot_quadtree(
-                qt,
-                ax=ax,
-                channel=0,
-                outline_width=outline_width,
-                colorbar=True,
-                vmin=vmin_global,
-                vmax=vmax_global,
-                draw_outlines=draw_outlines,
-                max_pixels=pred_max_pixels,
-                x_frac=x_frac,
-                y_frac=y_frac,
-            )
-            ax.set_title(f"AR model: {field} (Frame {frame})", fontsize=14)
-            return []
-
-        anim_pred = animation.FuncAnimation(fig, _update_pred, frames=predict_steps, blit=False)
-        fig.tight_layout()
-        anim_pred.save(f"{base_filename}_Pred.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
-        plt.close(fig)
-
-        # --- Optional snapshot PNGs ---
-        for idx1 in save_at_indices:
-            frame = idx1 - 1
-            if frame < min(predict_steps, T_gt):
-                fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-                ax = fig.add_subplot(111)
-                ax.grid(False)
-                gt_frame = {
-                    lvl: arr[:, c_idx : c_idx + 1, frame] for lvl, arr in gt_by_level.items()
+        def _build_gt_qt_native(gt_frame_per_level, frame, c_idx):
+            """Build GT quadtree; if gt_grid_mode==adaptive, snap to the
+            prediction's per-step topology by routing through the dense
+            uniform field and re-binning via assign_from_array."""
+            if gt_grid_mode == "adaptive":
+                gt_uniform = tensor_to_uniform_native(
+                    gt_frame_per_level, ref_l2b, ref_meta
+                )
+                seed_frame = {
+                    lvl: arr[:, c_idx : c_idx + 1, 0]
+                    for lvl, arr in all_preds_by_level[frame].items()
+                }
+                step_meta = {
+                    "centers": all_centers[frame],
+                    "levels": all_levels[frame],
+                    "domain": domain,
                 }
                 qt = tensor_to_quadtree_native(
-                    gt_frame, ref_l2b, ref_meta, cell_scale_mode=cell_scale_mode
+                    seed_frame,
+                    all_leaf_to_bucket[frame],
+                    step_meta,
+                    cell_scale_mode=cell_scale_mode,
+                )
+                qt.assign_from_array(
+                    gt_uniform,
+                    extent=(
+                        domain["xmin"], domain["xmax"],
+                        domain["ymin"], domain["ymax"],
+                    ),
+                )
+                return qt
+            return tensor_to_quadtree_native(
+                gt_frame_per_level, ref_l2b, ref_meta, cell_scale_mode=cell_scale_mode
+            )
+
+        if not args.png_only:
+            # --- GT GIF (quadtree overlay via plot_quadtree) ---
+            fig = plt.figure(figsize=native_figsize, dpi=anim_dpi)
+
+            def _update_gt(frame, fig=fig, c_idx=c_idx):
+                fig.clf()
+                ax, cax = anim_style.make_aligned_axes(fig, native_ax_rect, native_cax_rect)
+                ax.grid(False)
+                gt_frame = {lvl: arr[:, c_idx : c_idx + 1, frame] for lvl, arr in gt_by_level.items()}
+                if gt_grid_mode == "overlay":
+                    pred_frame_per_level = {
+                        lvl: arr[:, c_idx : c_idx + 1, 0]
+                        for lvl, arr in all_preds_by_level[frame].items()
+                    }
+                    step_meta = {
+                        "centers": all_centers[frame],
+                        "levels": all_levels[frame],
+                        "domain": domain,
+                    }
+                    pred_qt = tensor_to_quadtree_native(
+                        pred_frame_per_level,
+                        all_leaf_to_bucket[frame],
+                        step_meta,
+                        cell_scale_mode=cell_scale_mode,
+                    )
+                    gt_uniform = tensor_to_uniform_native(gt_frame, ref_l2b, ref_meta)
+                    plot_quadtree(
+                        pred_qt,
+                        ax=ax,
+                        channel=None,
+                        bg=gt_uniform[0],
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
+                    )
+                else:
+                    qt = _build_gt_qt_native(gt_frame, frame, c_idx)
+                    plot_quadtree(
+                        qt,
+                        ax=ax,
+                        channel=0,
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        max_pixels=max_pixels if max_pixels is not None else 2048,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
+                    )
+                anim_style.finalize_axes(
+                    ax,
+                    title=f"{gt_gif_prefix} (Frame {frame})",
+                    show_axes=show_axes,
+                )
+                return []
+
+            anim_gt = animation.FuncAnimation(
+                fig, _update_gt, frames=min(predict_steps, T_gt), blit=False
+            )
+            anim_gt.save(f"{gt_base_filename}.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
+            plt.close(fig)
+
+            # --- Prediction GIF (quadtree overlay via plot_quadtree) ---
+            fig = plt.figure(figsize=native_figsize, dpi=anim_dpi)
+
+            def _update_pred(frame, fig=fig, c_idx=c_idx):
+                fig.clf()
+                ax, cax = anim_style.make_aligned_axes(fig, native_ax_rect, native_cax_rect)
+                ax.grid(False)
+                p = all_preds_by_level[frame]
+                pred_frame = {lvl: arr[:, c_idx : c_idx + 1, 0] for lvl, arr in p.items()}
+                step_meta = {
+                    "centers": all_centers[frame],
+                    "levels": all_levels[frame],
+                    "domain": domain,
+                }
+                qt = tensor_to_quadtree_native(
+                    pred_frame, all_leaf_to_bucket[frame], step_meta, cell_scale_mode=cell_scale_mode
                 )
                 plot_quadtree(
                     qt,
@@ -632,21 +692,87 @@ def _animate_native(
                     channel=0,
                     outline_width=outline_width,
                     colorbar=True,
+                    cax=cax,
                     vmin=vmin_global,
                     vmax=vmax_global,
                     draw_outlines=draw_outlines,
-                    max_pixels=max_pixels if max_pixels is not None else 2048,
+                    max_pixels=pred_max_pixels,
                     x_frac=x_frac,
                     y_frac=y_frac,
                 )
-                # ax.set_title(f"Physics simulation: {field} (Frame {frame})", fontsize=14) #ignore title for manuscript  # noqa: E501
-                fig.tight_layout()
+                anim_style.finalize_axes(
+                    ax,
+                    title=f"{pred_gif_prefix} (Frame {frame})",
+                    show_axes=show_axes,
+                )
+                return []
+
+            anim_pred = animation.FuncAnimation(fig, _update_pred, frames=predict_steps, blit=False)
+            anim_pred.save(f"{base_filename}_Pred.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
+            plt.close(fig)
+
+        # --- Optional snapshot PNGs ---
+        for idx1 in save_at_indices:
+            frame = idx1 - 1
+            if frame < min(predict_steps, T_gt):
+                fig, ax, cax = anim_style.make_aligned_figure(native_aspect, anim_dpi, show_axes=show_axes)
+                ax.grid(False)
+                gt_frame = {
+                    lvl: arr[:, c_idx : c_idx + 1, frame] for lvl, arr in gt_by_level.items()
+                }
+                if gt_grid_mode == "overlay":
+                    pred_frame_per_level = {
+                        lvl: arr[:, c_idx : c_idx + 1, 0]
+                        for lvl, arr in all_preds_by_level[frame].items()
+                    }
+                    step_meta = {
+                        "centers": all_centers[frame],
+                        "levels": all_levels[frame],
+                        "domain": domain,
+                    }
+                    pred_qt = tensor_to_quadtree_native(
+                        pred_frame_per_level,
+                        all_leaf_to_bucket[frame],
+                        step_meta,
+                        cell_scale_mode=cell_scale_mode,
+                    )
+                    gt_uniform = tensor_to_uniform_native(gt_frame, ref_l2b, ref_meta)
+                    plot_quadtree(
+                        pred_qt,
+                        ax=ax,
+                        channel=None,
+                        bg=gt_uniform[0],
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
+                    )
+                else:
+                    qt = _build_gt_qt_native(gt_frame, frame, c_idx)
+                    plot_quadtree(
+                        qt,
+                        ax=ax,
+                        channel=0,
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        max_pixels=max_pixels if max_pixels is not None else 2048,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
+                    )
+                anim_style.finalize_axes(ax, title=args.gt_display_name, show_axes=show_axes)
                 fig.savefig(f"{gt_base_filename}_saveat{idx1}.png", dpi=anim_dpi)
                 plt.close(fig)
 
             if frame < predict_steps:
-                fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-                ax = fig.add_subplot(111)
+                fig, ax, cax = anim_style.make_aligned_figure(native_aspect, anim_dpi, show_axes=show_axes)
                 ax.grid(False)
                 p = all_preds_by_level[frame]
                 pred_frame = {lvl: arr[:, c_idx : c_idx + 1, 0] for lvl, arr in p.items()}
@@ -667,6 +793,7 @@ def _animate_native(
                     channel=0,
                     outline_width=outline_width,
                     colorbar=True,
+                    cax=cax,
                     vmin=vmin_global,
                     vmax=vmax_global,
                     draw_outlines=draw_outlines,
@@ -674,8 +801,7 @@ def _animate_native(
                     x_frac=x_frac,
                     y_frac=y_frac,
                 )
-                # ax.set_title(f"AR model: {field} (Frame {frame})", fontsize=14)#ignore title for manuscript  # noqa: E501
-                fig.tight_layout()
+                anim_style.finalize_axes(ax, title=args.display_name, show_axes=show_axes)
                 fig.savefig(f"{base_filename}_Pred_saveat{idx1}.png", dpi=anim_dpi)
                 plt.close(fig)
 
@@ -703,6 +829,23 @@ def main():
         default=None,
         help="1-based snapshot indices to save as PNG (e.g., '25' or '10,25,40').",
     )
+    parser.add_argument(
+        "--display_name",
+        type=str,
+        default="AR model",
+        help="Title prefix for the prediction frames (e.g., 'WAMRViT', 'ViT-finest').",
+    )
+    parser.add_argument(
+        "--gt_display_name",
+        type=str,
+        default="GT",
+        help="Title prefix for the ground-truth frames.",
+    )
+    parser.add_argument(
+        "--png_only",
+        action="store_true",
+        help="Skip GIF rendering; only emit the --save_at snapshot PNGs (and aux soot foil if --aux_plot).",
+    )
     args, unknown = parser.parse_known_args()
 
     config = load_config(args, unknown)
@@ -718,6 +861,7 @@ def main():
     os.makedirs(anim_dir, exist_ok=True)
     anim_dpi = anim_cfg.get("dpi", 150)
     anim_fps = anim_cfg.get("fps", 4)
+    show_axes = anim_cfg.get("show_axes", True)
 
     model_name = config["inference"]["checkpoint_path"].split("/")[-2]
 
@@ -777,6 +921,7 @@ def main():
     regrid_interval = config["inference"].get("regrid_interval", None)
     regrid_adapt_nearby = config["inference"].get("regrid_adapt_nearby", 0)
     regrid_tol_frac = config["inference"].get("regrid_tol_frac", tol_frac)
+    regrid_backend = config["inference"].get("regrid_backend", "object")
     pred_mode = config["inference"].get("pred_mode", "target")
     outline_width = float(anim_cfg.get("outline_width", 0.3))
     draw_outlines = bool(anim_cfg.get("draw_outlines", True))
@@ -809,7 +954,7 @@ def main():
 
     x_frac, y_frac = _parse_plot_frac(anim_cfg)
     gt_grid_mode = str(anim_cfg.get("gt_grid_mode", "adaptive")).strip().lower()
-    if gt_grid_mode not in {"adaptive", "static"}:
+    if gt_grid_mode not in {"adaptive", "static", "overlay"}:
         warnings.warn(
             f"animation.gt_grid_mode={gt_grid_mode!r} is invalid; falling back to 'adaptive'."
         )
@@ -872,6 +1017,7 @@ def main():
             model_name=model_name,
             data_config=data_config,
             outline_width=outline_width,
+            gt_grid_mode=gt_grid_mode,
             draw_outlines=draw_outlines,
             x_frac=x_frac,
             y_frac=y_frac,
@@ -908,6 +1054,15 @@ def main():
         "tile_height": _unpack(batch["tile_height"]).item(),
     }
     meta = {"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain}
+
+    uniform_aspect = anim_style.resolve_aspect(
+        domain["ymax"] - domain["ymin"], domain["xmax"] - domain["xmin"],
+        x_frac=x_frac, y_frac=y_frac, override=anim_cfg.get("data_aspect"),
+    )
+    uniform_figsize, uniform_ax_rect, uniform_cax_rect = anim_style.compute_layout(
+        uniform_aspect, show_axes=show_axes
+    )
+    print(f"[layout] uniform: data aspect H/W = {uniform_aspect:.4f}")
 
     N_grids, C, T_in, H, W = inputs.shape
     R = model.config.return_seq_len
@@ -950,8 +1105,6 @@ def main():
                     .cpu()
                     .numpy()
                 )
-                qt = tensor_to_quadtree(flat_input, meta, cell_scale_mode=cell_scale_mode)
-
                 ch_offset = (t_in - 1) * c_in
                 use_channels = (
                     [ch + ch_offset for ch in adapt_on_channels]
@@ -959,17 +1112,16 @@ def main():
                     else list(range(ch_offset, t_in * c_in))
                 )
 
-                regrid(
-                    qt,
+                new_input_np, meta = regrid_uniform_dispatch(
+                    flat_input,
+                    meta,
+                    backend=regrid_backend,
+                    max_passes=10,
+                    cell_scale_mode=cell_scale_mode,
                     tol_frac=regrid_tol_frac,
                     channel=use_channels,
-                    max_passes=10,
                     adapt_nearby=regrid_adapt_nearby,
-                    disable_warnings=True,
-                )
-
-                new_input_np, meta = quadtree_to_tensor(
-                    qt, return_tensor=False, cell_scale_mode=cell_scale_mode
+                    allow_coarsening=True,
                 )
                 centers = torch.from_numpy(meta["centers"]).to(device, dtype=torch.float32)
 
@@ -1038,6 +1190,11 @@ def main():
         gt_base_filename = os.path.join(
             anim_dir, f"GT_{field}_traj{args.traj_idx}_frame{args.frame_idx}"
         )
+        # Title prefixes: omit the "name: " segment when the display name is
+        # empty, matching animate_regular.py so an empty name yields just the
+        # field (no leading ": ").
+        gt_gif_prefix = f"{args.gt_display_name}: {field}" if args.gt_display_name else field
+        pred_gif_prefix = f"{args.display_name}: {field}" if args.display_name else field
 
         vmin_global, vmax_global = compute_vrange(
             [gt_field_seq],
@@ -1057,112 +1214,202 @@ def main():
             gt_source_centers = None
             gt_source_levels = None
 
-        # Save Ground Truth (configurable: static or adaptive grid)
-        save_single_gif(
-            gt_field_seq,
-            gt_centers_seq,
-            gt_levels_seq,
-            domain,
-            predict_steps,
-            f"Physics simulation: {field}",
-            f"{gt_base_filename}.gif",
-            cell_scale_mode,
-            dpi=anim_dpi,
-            fps=anim_fps,
-            vmin=vmin_global,
-            vmax=vmax_global,
-            outline_width=outline_width,
-            draw_outlines=draw_outlines,
-            x_frac=x_frac,
-            y_frac=y_frac,
-            max_pixels=max_pixels,
-            source_centers=gt_source_centers,
-            source_levels=gt_source_levels,
-            remap_mode=gt_adaptive_remap,
-        )
+        if not args.png_only:
+            if gt_grid_mode == "overlay":
+                # Dense GT imshow + per-step prediction outlines overlaid.
+                fig_gt = plt.figure(figsize=uniform_figsize, dpi=anim_dpi)
 
-        # Render Prediction step-by-step (per-timestep storage: each entry has T=1)
-        def update_dynamic(frame, ax, vmax, vmin):
-            frame_data = np.ascontiguousarray(pred_field_seqs[frame][:, :, 0, :, :])
-            frame_tensor = torch.from_numpy(frame_data)
+                def _update_gt_overlay(frame, fig=fig_gt):
+                    fig.clf()
+                    ax, cax = anim_style.make_aligned_axes(fig, uniform_ax_rect, uniform_cax_rect)
+                    ax.grid(False)
+                    gt_frame_data = np.ascontiguousarray(
+                        gt_field_seq[:, :, frame, :, :]
+                    )
+                    pred_frame_data = np.ascontiguousarray(
+                        pred_field_seqs[frame][:, :, 0, :, :]
+                    )
+                    pred_qt = tensor_to_quadtree(
+                        data=torch.from_numpy(pred_frame_data),
+                        meta={
+                            "centers": all_centers[frame],
+                            "levels": all_levels[frame],
+                            "domain": domain,
+                        },
+                        cell_scale_mode=cell_scale_mode,
+                    )
+                    plot_quadtree(
+                        pred_qt,
+                        ax=ax,
+                        channel=None,
+                        bg=gt_frame_data[0, 0],
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
+                    )
+                    anim_style.finalize_axes(
+                        ax,
+                        title=f"{gt_gif_prefix} (Frame {frame})",
+                        show_axes=show_axes,
+                    )
+                    return []
 
-            step_meta = {
-                "centers": all_centers[frame],
-                "levels": all_levels[frame],
-                "domain": domain,
-            }
-            qt = tensor_to_quadtree(
-                data=frame_tensor, meta=step_meta, cell_scale_mode=cell_scale_mode
-            )
-            ax.grid(False)
-            plot_quadtree(
-                qt,
-                ax=ax,
-                channel=0,
-                outline_width=outline_width,
-                colorbar=True,
-                vmin=vmin,
-                vmax=vmax,
-                draw_outlines=draw_outlines,
-                max_pixels=pred_max_pixels,
-                x_frac=x_frac,
-                y_frac=y_frac,
-            )
-            ax.set_title(f"AR model: {field} (Frame {frame})", fontsize=16, pad=15)
-            return []
+                anim_gt = animation.FuncAnimation(
+                    fig_gt, _update_gt_overlay, frames=predict_steps, blit=False
+                )
+                anim_gt.save(
+                    f"{gt_base_filename}.gif",
+                    writer="pillow",
+                    fps=anim_fps,
+                    dpi=anim_dpi,
+                )
+                plt.close(fig_gt)
+            else:
+                # Save Ground Truth (configurable: static or adaptive grid)
+                save_single_gif(
+                    gt_field_seq,
+                    gt_centers_seq,
+                    gt_levels_seq,
+                    domain,
+                    predict_steps,
+                    gt_gif_prefix,
+                    f"{gt_base_filename}.gif",
+                    cell_scale_mode,
+                    dpi=anim_dpi,
+                    fps=anim_fps,
+                    vmin=vmin_global,
+                    vmax=vmax_global,
+                    outline_width=outline_width,
+                    draw_outlines=draw_outlines,
+                    x_frac=x_frac,
+                    y_frac=y_frac,
+                    max_pixels=max_pixels,
+                    source_centers=gt_source_centers,
+                    source_levels=gt_source_levels,
+                    remap_mode=gt_adaptive_remap,
+                    show_axes=show_axes,
+                    aspect=uniform_aspect,
+                )
 
-        fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
+            # Render Prediction step-by-step (per-timestep storage: each entry has T=1)
+            def update_dynamic(frame, ax, cax, vmax, vmin):
+                frame_data = np.ascontiguousarray(pred_field_seqs[frame][:, :, 0, :, :])
+                frame_tensor = torch.from_numpy(frame_data)
 
-        def wrapper_update(frame):
-            fig.clf()
-            ax = fig.add_subplot(111)
-            return update_dynamic(frame, ax, vmax_global, vmin_global)
+                step_meta = {
+                    "centers": all_centers[frame],
+                    "levels": all_levels[frame],
+                    "domain": domain,
+                }
+                qt = tensor_to_quadtree(
+                    data=frame_tensor, meta=step_meta, cell_scale_mode=cell_scale_mode
+                )
+                ax.grid(False)
+                plot_quadtree(
+                    qt,
+                    ax=ax,
+                    channel=0,
+                    outline_width=outline_width,
+                    colorbar=True,
+                    cax=cax,
+                    vmin=vmin,
+                    vmax=vmax,
+                    draw_outlines=draw_outlines,
+                    max_pixels=pred_max_pixels,
+                    x_frac=x_frac,
+                    y_frac=y_frac,
+                )
+                anim_style.finalize_axes(
+                    ax,
+                    title=f"{pred_gif_prefix} (Frame {frame})",
+                    show_axes=show_axes,
+                )
+                return []
 
-        anim = animation.FuncAnimation(fig, wrapper_update, frames=predict_steps, blit=False)
-        fig.tight_layout()
-        anim.save(f"{base_filename}_Pred.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
-        plt.close(fig)
+            fig = plt.figure(figsize=uniform_figsize, dpi=anim_dpi)
+
+            def wrapper_update(frame):
+                fig.clf()
+                ax, cax = anim_style.make_aligned_axes(fig, uniform_ax_rect, uniform_cax_rect)
+                result = update_dynamic(frame, ax, cax, vmax_global, vmin_global)
+                return result
+
+            anim = animation.FuncAnimation(fig, wrapper_update, frames=predict_steps, blit=False)
+            anim.save(f"{base_filename}_Pred.gif", writer="pillow", fps=anim_fps, dpi=anim_dpi)
+            plt.close(fig)
 
         # Optional snapshot PNGs (1-based indices mapped to 0-based frames).
         for idx1 in save_at_indices:
             frame = idx1 - 1
             if frame < predict_steps:
                 gt_frame_data = np.ascontiguousarray(gt_field_seq[:, :, frame, :, :])
-                if gt_grid_mode == "adaptive":
-                    gt_qt = _build_quadtree_with_optional_projection(
-                        gt_frame_data,
-                        target_centers=all_centers[frame],
-                        target_levels=all_levels[frame],
-                        domain_meta=domain,
+                fig, ax, cax = anim_style.make_aligned_figure(uniform_aspect, anim_dpi, show_axes=show_axes)
+                ax.grid(False)
+                if gt_grid_mode == "overlay":
+                    pred_frame_data = np.ascontiguousarray(
+                        pred_field_seqs[frame][:, :, 0, :, :]
+                    )
+                    pred_qt = tensor_to_quadtree(
+                        data=torch.from_numpy(pred_frame_data),
+                        meta={
+                            "centers": all_centers[frame],
+                            "levels": all_levels[frame],
+                            "domain": domain,
+                        },
                         cell_scale_mode=cell_scale_mode,
-                        source_centers=ref_centers_np,
-                        source_levels=ref_levels_np,
-                        remap_mode=gt_adaptive_remap,
+                    )
+                    plot_quadtree(
+                        pred_qt,
+                        ax=ax,
+                        channel=None,
+                        bg=gt_frame_data[0, 0],
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
                     )
                 else:
-                    gt_qt = tensor_to_quadtree(
-                        data=torch.from_numpy(gt_frame_data),
-                        meta={"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain},
-                        cell_scale_mode=cell_scale_mode,
+                    if gt_grid_mode == "adaptive":
+                        gt_qt = _build_quadtree_with_optional_projection(
+                            gt_frame_data,
+                            target_centers=all_centers[frame],
+                            target_levels=all_levels[frame],
+                            domain_meta=domain,
+                            cell_scale_mode=cell_scale_mode,
+                            source_centers=ref_centers_np,
+                            source_levels=ref_levels_np,
+                            remap_mode=gt_adaptive_remap,
+                        )
+                    else:
+                        gt_qt = tensor_to_quadtree(
+                            data=torch.from_numpy(gt_frame_data),
+                            meta={"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain},
+                            cell_scale_mode=cell_scale_mode,
+                        )
+                    plot_quadtree(
+                        gt_qt,
+                        ax=ax,
+                        channel=0,
+                        outline_width=outline_width,
+                        colorbar=True,
+                        cax=cax,
+                        vmin=vmin_global,
+                        vmax=vmax_global,
+                        draw_outlines=draw_outlines,
+                        max_pixels=max_pixels if max_pixels is not None else 2048,
+                        x_frac=x_frac,
+                        y_frac=y_frac,
                     )
-                fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-                ax = fig.add_subplot(111)
-                ax.grid(False)
-                plot_quadtree(
-                    gt_qt,
-                    ax=ax,
-                    channel=0,
-                    outline_width=outline_width,
-                    colorbar=True,
-                    vmin=vmin_global,
-                    vmax=vmax_global,
-                    draw_outlines=draw_outlines,
-                    max_pixels=max_pixels if max_pixels is not None else 2048,
-                    x_frac=x_frac,
-                    y_frac=y_frac,
-                )
-                # ax.set_title(f"Physics simulation: {field} (Frame {frame})", fontsize=16, pad=15)# ignore title for manuscript  # noqa: E501
-                fig.tight_layout()
+                anim_style.finalize_axes(ax, title=args.gt_display_name, show_axes=show_axes)
                 fig.savefig(f"{gt_base_filename}_saveat{idx1}.png", dpi=anim_dpi)
                 plt.close(fig)
 
@@ -1176,8 +1423,7 @@ def main():
                     },
                     cell_scale_mode=cell_scale_mode,
                 )
-                fig = plt.figure(figsize=(6, 6), dpi=anim_dpi)
-                ax = fig.add_subplot(111)
+                fig, ax, cax = anim_style.make_aligned_figure(uniform_aspect, anim_dpi, show_axes=show_axes)
                 ax.grid(False)
                 plot_quadtree(
                     pred_qt,
@@ -1185,6 +1431,7 @@ def main():
                     channel=0,
                     outline_width=outline_width,
                     colorbar=True,
+                    cax=cax,
                     vmin=vmin_global,
                     vmax=vmax_global,
                     draw_outlines=draw_outlines,
@@ -1192,8 +1439,7 @@ def main():
                     x_frac=x_frac,
                     y_frac=y_frac,
                 )
-                # ax.set_title(f"AR model: {field} (Frame {frame})", fontsize=16, pad=15) #ignore title for manuscript  # noqa: E501
-                fig.tight_layout()
+                anim_style.finalize_axes(ax, title=args.display_name, show_axes=show_axes)
                 fig.savefig(f"{base_filename}_Pred_saveat{idx1}.png", dpi=anim_dpi)
                 plt.close(fig)
 
@@ -1266,7 +1512,7 @@ def main():
                 ax.set_title(title, fontsize=14, pad=10)
                 fig.colorbar(im, ax=ax, pad=0.02, label="Pressure")
                 fig.tight_layout()
-                fig.savefig(out_path, dpi=anim_dpi)
+                fig.savefig(out_path, dpi=anim_dpi, bbox_inches="tight")
                 plt.close(fig)
 
             base_filename = os.path.join(
@@ -1279,13 +1525,13 @@ def main():
             _plot_soot(
                 gt_pmax,
                 gt_extent,
-                "Physics simulation",
+                args.gt_display_name,
                 f"{gt_base_filename}_soot_foil.png",
             )
             _plot_soot(
                 pred_pmax,
                 pred_extent,
-                "AR model",
+                args.display_name,
                 f"{base_filename}_Pred_soot_foil.png",
             )
 

@@ -14,7 +14,12 @@ import torch
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.dataloader.transform import inverse_transform_src
 from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid, regrid_native
+from wamrvit.quad.adapt_wavelet import regrid_native
+from wamrvit.quad.regrid_dispatch import (
+    regrid_native_dispatch,
+    regrid_uniform_dispatch,
+    RegridProfiler,
+)
 from wamrvit.quad.quad_utils import (
     quadtree_to_tensor,
     quadtree_to_tensor_native,
@@ -213,6 +218,14 @@ class AutoregressivePredictorAdaptive:
             )
             self.regrid_tol_frac = self.tol_frac
 
+        self.regrid_backend = inf_cfg.get("regrid_backend", "object")
+        # Profiling is opt-in (regrid_profile): default object rollouts stay
+        # side-effect-free -- no timing CSVs written. Active only for a comparison run.
+        self.regrid_profiler = RegridProfiler() if inf_cfg.get("regrid_profile", False) else None
+        # Output dir for profiler files: beside the metric CSV (set in main before actors spawn).
+        _out_csv = inf_cfg.get("output_csv")
+        self.regrid_out_dir = os.path.dirname(_out_csv) if _out_csv else os.getcwd()
+
         if (
             self.regrid_interval is not None
             and self.regrid_interval % self.model_return_seq_len != 0
@@ -290,6 +303,8 @@ class AutoregressivePredictorAdaptive:
         all_centers = []
         all_levels = []
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.new_sample()
         with torch.no_grad():
             for call_idx in range(self.num_forward_calls):
                 timestep_idx = call_idx * R
@@ -311,8 +326,6 @@ class AutoregressivePredictorAdaptive:
                         .cpu()
                         .numpy()
                     )
-                    qt = tensor_to_quadtree(flat_input, meta, cell_scale_mode=self.cell_scale_mode)
-
                     # Adapt on the last frame's channels (offset into packed T*C axis).
                     ch_offset = (t_in - 1) * c_in
                     use_channels = (
@@ -321,18 +334,17 @@ class AutoregressivePredictorAdaptive:
                         else list(range(ch_offset, t_in * c_in))
                     )
 
-                    regrid(
-                        qt,
+                    new_input_np, meta = regrid_uniform_dispatch(
+                        flat_input,
+                        meta,
+                        backend=self.regrid_backend,
+                        profiler=self.regrid_profiler,
+                        max_passes=10,
+                        cell_scale_mode=self.cell_scale_mode,
                         tol_frac=self.regrid_tol_frac,
                         channel=use_channels,
-                        max_passes=10,
                         adapt_nearby=self.regrid_adapt_nearby,
                         allow_coarsening=self.allow_coarsening,
-                        disable_warnings=True,
-                    )
-
-                    new_input_np, meta = quadtree_to_tensor(
-                        qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
                     )
                     # new_input_np: (new_N, T_in*C, Ph, Pw); meta["centers"]: (new_N, 3).
                     centers = torch.from_numpy(meta["centers"]).to(
@@ -424,6 +436,8 @@ class AutoregressivePredictorAdaptive:
         if "frame_idx" in batch:
             out_dict["frame_idx"] = batch["frame_idx"]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
         return out_dict
 
     # ------------------------------------------------------------------
@@ -477,6 +491,8 @@ class AutoregressivePredictorAdaptive:
         all_centers = []  # list[(N, 3)]
         all_levels = []  # list[(N,)]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.new_sample()
         with torch.no_grad():
             for call_idx in range(self.num_forward_calls):
                 timestep_idx = call_idx * R
@@ -579,6 +595,8 @@ class AutoregressivePredictorAdaptive:
         if "frame_idx" in batch:
             out_dict["frame_idx"] = batch["frame_idx"]
 
+        if self.regrid_profiler is not None:
+            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
         return out_dict
 
     def _regrid_native(self, curr_by_level, leaf_to_bucket, meta):
@@ -605,10 +623,12 @@ class AutoregressivePredictorAdaptive:
         np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
         l2b_np = leaf_to_bucket.cpu().numpy()
 
-        new_by_level_np, new_l2b, new_meta = regrid_native(
+        new_by_level_np, new_l2b, new_meta = regrid_native_dispatch(
             np_by_level,
             l2b_np,
             meta,
+            backend=self.regrid_backend,
+            profiler=self.regrid_profiler,
             C=C_orig,
             T=T_in,
             tol_frac=self.regrid_tol_frac,

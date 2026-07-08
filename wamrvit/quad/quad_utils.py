@@ -330,7 +330,11 @@ def quadtree_to_uniform(
         py_end = py_start + ((1 << scale) * qt.patch_height)
 
         if scale > 0:
-            # Nearest-neighbor upsampling to match refine() injection behavior
+            # SCORING ONLY: nearest-neighbor upsample of coarse cells onto the dense grid
+            # for the uniform-adaptive full-field metric. NOTE: refine() value-fill is now
+            # bilinear (object/array byte-parity), so this no longer mirrors refine -- kept
+            # nearest deliberately for now. It is applied IDENTICALLY to both regrid backends,
+            # so it does not affect the object-vs-array comparison (only absolute metric scale).
             val_up = np.repeat(np.repeat(val, 1 << scale, axis=1), 1 << scale, axis=2)
             out[:, py_start:py_end, px_start:px_end] = val_up
         else:
@@ -433,7 +437,11 @@ def tensor_to_uniform(
 
         # 4. Upsample if the patch isn't at the maximum resolution
         if scale > 0:
-            # Nearest-neighbor upsampling to match refine() injection behavior
+            # SCORING ONLY: nearest-neighbor upsample of coarse cells onto the dense grid
+            # for the uniform-adaptive full-field metric. NOTE: refine() value-fill is now
+            # bilinear (object/array byte-parity), so this no longer mirrors refine -- kept
+            # nearest deliberately for now. It is applied IDENTICALLY to both regrid backends,
+            # so it does not affect the object-vs-array comparison (only absolute metric scale).
             val = np.repeat(np.repeat(val, 1 << scale, axis=1), 1 << scale, axis=2)
 
         out[:, py_start:py_end, px_start:px_end] = val

@@ -9,8 +9,6 @@ regrid block separately. Writes a JSON with per-trajectory and aggregated means.
 No metric computation, no GT loading beyond what the loader emits incidentally,
 no Ray, no DDP. Single-GPU, single-process.
 
-See docs/zany-petting-cookie or the plan file for design details.
-
 Usage:
     uv run wamrvit/rollout/benchmark_inference.py \\
         +experiment=benchmark_inference \\
@@ -34,8 +32,9 @@ import torch
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid, regrid_native
+from wamrvit.quad.adapt_wavelet import regrid
 from wamrvit.quad.quad_utils import quadtree_to_tensor, tensor_to_quadtree
+from wamrvit.quad.regrid_dispatch import regrid_native_dispatch, regrid_uniform_dispatch
 from wamrvit.quad.yt_utils import make_regular_centers
 from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
@@ -119,6 +118,11 @@ class BenchmarkRunner:
         self.regrid_interval = inf_cfg.get("regrid_interval", None)
         self.regrid_adapt_nearby = int(inf_cfg.get("regrid_adapt_nearby", 0))
         self.allow_coarsening = inf_cfg.get("allow_coarsening", True)
+        self.regrid_backend = inf_cfg.get("regrid_backend", "object")
+        if self.regrid_backend not in ("object", "array"):
+            raise ValueError(
+                f"inference.regrid_backend={self.regrid_backend!r}; expected 'object' or 'array'."
+            )
 
         loader_params = config.get("file_loader", {}).get("params", {}) or {}
         self.cell_scale_mode = loader_params.get("cell_scale_mode", "area")
@@ -288,11 +292,17 @@ class BenchmarkRunner:
         forward_times: list[float] = []
         regrid_times: list[float] = []  # 0.0 for non-regrid calls; positive on regrid calls.
         n_cells_per_call: list[int] = []  # token count fed to each forward (= centers.shape[0]).
+        # Per-event sub-step lists: list[float] of length == num_regrid_events.
+        # Empty for regular/swin variants. Sum of substeps ≈ regrid_times sum
+        # (modulo nanoseconds in trivial Python ops between the with-blocks).
+        rg_substeps: dict[str, list[float]] = {
+            "d2h": [], "t2q": [], "core": [], "q2t": [], "h2d": [],
+        }
 
         if self.variant == "adaptive_uniform":
-            self._rollout_uniform(sp, forward_times, regrid_times, n_cells_per_call)
+            self._rollout_uniform(sp, forward_times, regrid_times, n_cells_per_call, rg_substeps)
         elif self.variant == "adaptive_native":
-            self._rollout_native(sp, forward_times, regrid_times, n_cells_per_call)
+            self._rollout_native(sp, forward_times, regrid_times, n_cells_per_call, rg_substeps)
         else:  # regular or swin
             self._rollout_regular(sp, forward_times, regrid_times, n_cells_per_call)
 
@@ -307,12 +317,18 @@ class BenchmarkRunner:
             "regrid_s": float(sum(regrid_times)),
             "total_s": float(sum(forward_times) + sum(regrid_times)),
             "mean_num_cells": float(np.mean(n_cells_per_call)) if n_cells_per_call else 0.0,
+            "regrid_substeps": rg_substeps,
         }
 
     # ----------------- variant kernels -----------------
 
     def _rollout_uniform(
-        self, sp: dict[str, Any], fwd_t: list[float], rg_t: list[float], n_cells_t: list[int]
+        self,
+        sp: dict[str, Any],
+        fwd_t: list[float],
+        rg_t: list[float],
+        n_cells_t: list[int],
+        rg_substeps: dict[str, list[float]],
     ):
         inputs = sp["input"].clone()
         centers = sp["centers"].clone()
@@ -334,44 +350,65 @@ class BenchmarkRunner:
                     and timestep_idx % self.regrid_interval == 0
                 ):
                     with _timed(regrid_block):
-                        N, c_in, t_in, h, w = inputs.shape
-                        flat_input = (
-                            inputs.transpose(1, 2)
-                            .contiguous()
-                            .view(N, t_in * c_in, h, w)
-                            .cpu()
-                            .numpy()
-                        )
-                        qt = tensor_to_quadtree(
-                            flat_input, meta, cell_scale_mode=self.cell_scale_mode
-                        )
+                        with _timed(rg_substeps["d2h"], sync_cuda=True):
+                            N, c_in, t_in, h, w = inputs.shape
+                            flat_input = (
+                                inputs.transpose(1, 2)
+                                .contiguous()
+                                .view(N, t_in * c_in, h, w)
+                                .cpu()
+                                .numpy()
+                            )
                         ch_offset = (t_in - 1) * c_in
                         use_channels = (
                             [ch + ch_offset for ch in self.adapt_on_channels]
                             if self.adapt_on_channels is not None
                             else list(range(ch_offset, t_in * c_in))
                         )
-                        regrid(
-                            qt,
-                            tol_frac=self.regrid_tol_frac,
-                            channel=use_channels,
-                            max_passes=10,
-                            adapt_nearby=self.regrid_adapt_nearby,
-                            allow_coarsening=self.allow_coarsening,
-                            disable_warnings=True,
-                        )
-                        new_input_np, meta = quadtree_to_tensor(
-                            qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                        )
-                        centers = torch.from_numpy(meta["centers"]).to(
-                            self.device, dtype=torch.float32
-                        )
-                        new_N = new_input_np.shape[0]
-                        inputs = torch.from_numpy(
-                            np.ascontiguousarray(new_input_np)
-                            .reshape(new_N, t_in, c_in, h, w)
-                            .transpose(0, 2, 1, 3, 4)
-                        ).to(self.device, dtype=torch.float32)
+                        if self.regrid_backend == "array":
+                            # Array engine adapts the packed (N, T*C, H, W) tensor
+                            # directly -- no quadtree build/teardown -- so t2q/q2t are
+                            # definitionally zero (eliding them IS the speedup). The whole
+                            # array regrid is timed as "core".
+                            rg_substeps["t2q"].append(0.0)
+                            with _timed(rg_substeps["core"], sync_cuda=False):
+                                new_input_np, meta = regrid_uniform_dispatch(
+                                    flat_input, meta, backend="array", profiler=None,
+                                    max_passes=10, cell_scale_mode=self.cell_scale_mode,
+                                    tol_frac=self.regrid_tol_frac, channel=use_channels,
+                                    adapt_nearby=self.regrid_adapt_nearby,
+                                    allow_coarsening=self.allow_coarsening,
+                                )
+                            rg_substeps["q2t"].append(0.0)
+                        else:
+                            with _timed(rg_substeps["t2q"], sync_cuda=False):
+                                qt = tensor_to_quadtree(
+                                    flat_input, meta, cell_scale_mode=self.cell_scale_mode
+                                )
+                            with _timed(rg_substeps["core"], sync_cuda=False):
+                                regrid(
+                                    qt,
+                                    tol_frac=self.regrid_tol_frac,
+                                    channel=use_channels,
+                                    max_passes=10,
+                                    adapt_nearby=self.regrid_adapt_nearby,
+                                    allow_coarsening=self.allow_coarsening,
+                                    disable_warnings=True,
+                                )
+                            with _timed(rg_substeps["q2t"], sync_cuda=False):
+                                new_input_np, meta = quadtree_to_tensor(
+                                    qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
+                                )
+                        with _timed(rg_substeps["h2d"], sync_cuda=True):
+                            centers = torch.from_numpy(meta["centers"]).to(
+                                self.device, dtype=torch.float32
+                            )
+                            new_N = new_input_np.shape[0]
+                            inputs = torch.from_numpy(
+                                np.ascontiguousarray(new_input_np)
+                                .reshape(new_N, t_in, c_in, h, w)
+                                .transpose(0, 2, 1, 3, 4)
+                            ).to(self.device, dtype=torch.float32)
                 rg_t.append(regrid_block[0] if regrid_block else 0.0)
 
                 # --- Forward block ---
@@ -390,7 +427,12 @@ class BenchmarkRunner:
                 fwd_t.append(fwd_block[0])
 
     def _rollout_native(
-        self, sp: dict[str, Any], fwd_t: list[float], rg_t: list[float], n_cells_t: list[int]
+        self,
+        sp: dict[str, Any],
+        fwd_t: list[float],
+        rg_t: list[float],
+        n_cells_t: list[int],
+        rg_substeps: dict[str, list[float]],
     ):
         curr = {lvl: v.clone() for lvl, v in sp["input_by_level"].items()}
         leaf_to_bucket = sp["leaf_to_bucket"].clone()
@@ -414,7 +456,7 @@ class BenchmarkRunner:
                 ):
                     with _timed(regrid_block):
                         curr, leaf_to_bucket, centers, meta = self._regrid_native_inplace(
-                            curr, leaf_to_bucket, meta
+                            curr, leaf_to_bucket, meta, rg_substeps
                         )
                 rg_t.append(regrid_block[0] if regrid_block else 0.0)
 
@@ -437,33 +479,115 @@ class BenchmarkRunner:
                                 curr[lvl] = pred_by_level[lvl][:, :, -T_in:]
                 fwd_t.append(fwd_block[0])
 
-    def _regrid_native_inplace(self, curr_by_level, leaf_to_bucket, meta):
-        """Mirror of AutoregressivePredictorAdaptive._regrid_native (no GT path)."""
-        C_orig = T_in = None
+    def _regrid_native_inplace(self, curr_by_level, leaf_to_bucket, meta, rg_substeps):
+        """Mirror of AutoregressivePredictorAdaptive._regrid_native (no GT path).
+        Inlines regrid_native() body so each sub-step gets its own timer."""
+        from wamrvit.quad.quad_utils import quadtree_to_tensor_native, tensor_to_quadtree_native
+
+        C_orig = T_in_local = None
         for arr in curr_by_level.values():
             if arr.shape[0] > 0:
-                C_orig, T_in = arr.shape[1], arr.shape[2]
+                C_orig, T_in_local = arr.shape[1], arr.shape[2]
                 break
-        np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
-        l2b_np = leaf_to_bucket.cpu().numpy()
-        new_by_level_np, new_l2b, new_meta = regrid_native(
-            np_by_level,
-            l2b_np,
-            meta,
-            C=C_orig,
-            T=T_in,
-            tol_frac=self.regrid_tol_frac,
-            cell_scale_mode=self.cell_scale_mode,
-            adapt_on_channels=self.adapt_on_channels,
-            adapt_nearby=self.regrid_adapt_nearby,
-            allow_coarsening=self.allow_coarsening,
-        )
-        new_by_level = {
-            lvl: torch.from_numpy(arr).to(self.device, dtype=torch.float32)
-            for lvl, arr in new_by_level_np.items()
-        }
-        new_l2b_t = torch.from_numpy(new_l2b).to(self.device).long()
-        new_centers_t = torch.from_numpy(new_meta["centers"]).to(self.device, dtype=torch.float32)
+
+        with _timed(rg_substeps["d2h"], sync_cuda=True):
+            np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
+            l2b_np = leaf_to_bucket.cpu().numpy()
+
+        if self.regrid_backend == "array":
+            # Array engine adapts the per-level packed buckets directly -- no quadtree
+            # build/teardown -- so t2q/q2t are definitionally zero. The pack + array
+            # regrid + per-level unpack are all timed as "core".
+            rg_substeps["t2q"].append(0.0)
+            with _timed(rg_substeps["core"], sync_cuda=False):
+                flat_by_level: dict[int, np.ndarray] = {}
+                for lvl, arr in np_by_level.items():
+                    if arr.shape[0] == 0:
+                        flat_by_level[lvl] = arr[:, :0]
+                        continue
+                    n, c, t, h, w = arr.shape
+                    flat_by_level[lvl] = arr.transpose(0, 2, 1, 3, 4).reshape(n, t * c, h, w)
+                new_buckets, new_l2b_np, new_meta = regrid_native_dispatch(
+                    flat_by_level, l2b_np, meta, backend="array", profiler=None,
+                    max_passes=10, C=C_orig, T=T_in_local, tol_frac=self.regrid_tol_frac,
+                    cell_scale_mode=self.cell_scale_mode,
+                    adapt_on_channels=self.adapt_on_channels,
+                    adapt_nearby=self.regrid_adapt_nearby,
+                    allow_coarsening=self.allow_coarsening,
+                )
+                new_by_level_np: dict[int, np.ndarray] = {}
+                for lvl, flat_arr in new_buckets.items():
+                    n_l = flat_arr.shape[0]
+                    if n_l == 0:
+                        h_l = flat_arr.shape[-2] if flat_arr.ndim >= 3 else 0
+                        w_l = flat_arr.shape[-1] if flat_arr.ndim >= 3 else 0
+                        new_by_level_np[lvl] = np.zeros(
+                            (0, C_orig, T_in_local, h_l, w_l), dtype=flat_arr.dtype
+                        )
+                        continue
+                    _, tc, h_l, w_l = flat_arr.shape
+                    new_by_level_np[lvl] = np.ascontiguousarray(
+                        flat_arr.reshape(n_l, T_in_local, C_orig, h_l, w_l).transpose(0, 2, 1, 3, 4)
+                    )
+            rg_substeps["q2t"].append(0.0)
+        else:
+            with _timed(rg_substeps["t2q"], sync_cuda=False):
+                flat_by_level: dict[int, np.ndarray] = {}
+                for lvl, arr in np_by_level.items():
+                    if arr.shape[0] == 0:
+                        flat_by_level[lvl] = arr[:, :0]
+                        continue
+                    n, c, t, h, w = arr.shape
+                    flat_by_level[lvl] = arr.transpose(0, 2, 1, 3, 4).reshape(n, t * c, h, w)
+                qt = tensor_to_quadtree_native(
+                    flat_by_level, l2b_np, meta, cell_scale_mode=self.cell_scale_mode
+                )
+
+            with _timed(rg_substeps["core"], sync_cuda=False):
+                ch_offset = (T_in_local - 1) * C_orig
+                use_channels = (
+                    [ch + ch_offset for ch in self.adapt_on_channels]
+                    if self.adapt_on_channels is not None
+                    else list(range(ch_offset, T_in_local * C_orig))
+                )
+                regrid(
+                    qt,
+                    tol_frac=self.regrid_tol_frac,
+                    channel=use_channels,
+                    max_passes=10,
+                    adapt_nearby=self.regrid_adapt_nearby,
+                    allow_coarsening=self.allow_coarsening,
+                    disable_warnings=True,
+                )
+
+            with _timed(rg_substeps["q2t"], sync_cuda=False):
+                new_buckets, new_l2b_np, new_meta = quadtree_to_tensor_native(
+                    qt, cell_scale_mode=self.cell_scale_mode
+                )
+                new_by_level_np: dict[int, np.ndarray] = {}
+                for lvl, flat_arr in new_buckets.items():
+                    n_l = flat_arr.shape[0]
+                    if n_l == 0:
+                        h_l = flat_arr.shape[-2] if flat_arr.ndim >= 3 else 0
+                        w_l = flat_arr.shape[-1] if flat_arr.ndim >= 3 else 0
+                        new_by_level_np[lvl] = np.zeros(
+                            (0, C_orig, T_in_local, h_l, w_l), dtype=flat_arr.dtype
+                        )
+                        continue
+                    _, tc, h_l, w_l = flat_arr.shape
+                    new_by_level_np[lvl] = np.ascontiguousarray(
+                        flat_arr.reshape(n_l, T_in_local, C_orig, h_l, w_l).transpose(0, 2, 1, 3, 4)
+                    )
+
+        with _timed(rg_substeps["h2d"], sync_cuda=True):
+            new_by_level = {
+                lvl: torch.from_numpy(arr).to(self.device, dtype=torch.float32)
+                for lvl, arr in new_by_level_np.items()
+            }
+            new_l2b_t = torch.from_numpy(new_l2b_np).to(self.device).long()
+            new_centers_t = torch.from_numpy(new_meta["centers"]).to(
+                self.device, dtype=torch.float32
+            )
         return new_by_level, new_l2b_t, new_centers_t, new_meta
 
     def _rollout_regular(
@@ -534,6 +658,20 @@ class BenchmarkRunner:
             agg["std_num_cells_per_call"] = float(per_call_cells.std(ddof=0))
             agg["min_num_cells"] = int(per_call_cells.min())
             agg["max_num_cells"] = int(per_call_cells.max())
+
+        # Sub-step breakdown (adaptive variants only). Per-event mean across
+        # all regrid events from all trajectories — directly comparable to
+        # mean_per_call_regrid_only_s. Sum of substeps ≈ envelope.
+        substep_keys = ["d2h", "t2q", "core", "q2t", "h2d"]
+        all_vals: dict[str, list[float]] = {k: [] for k in substep_keys}
+        for t in per_traj:
+            rs = t.get("regrid_substeps", {})
+            for k in substep_keys:
+                all_vals[k].extend(rs.get(k, []))
+        if any(all_vals[k] for k in substep_keys):
+            for k in substep_keys:
+                v = all_vals[k]
+                agg[f"mean_per_event_regrid_{k}_s"] = float(np.mean(v)) if v else 0.0
         return agg
 
     def run(self) -> dict[str, Any]:
@@ -612,6 +750,19 @@ def main():
     if runner.variant in ("adaptive_uniform", "adaptive_native"):
         print(f"  mean_forward_s = {agg['mean_forward_s']:.3f}")
         print(f"  mean_regrid_s = {agg['mean_regrid_s']:.3f}  (frac={agg['frac_regrid']:.1%})")
+        if "mean_per_event_regrid_core_s" in agg:
+            envelope = agg.get("mean_per_call_regrid_only_s", 0.0)
+            substep_sum = sum(
+                agg.get(f"mean_per_event_regrid_{k}_s", 0.0)
+                for k in ("d2h", "t2q", "core", "q2t", "h2d")
+            )
+            print(f"  per-event regrid breakdown (envelope={envelope:.4f}s):")
+            print(f"    d2h  = {agg['mean_per_event_regrid_d2h_s']:.4f}s")
+            print(f"    t2q  = {agg['mean_per_event_regrid_t2q_s']:.4f}s  (tensor_to_quadtree)")
+            print(f"    core = {agg['mean_per_event_regrid_core_s']:.4f}s  (regrid() function)")
+            print(f"    q2t  = {agg['mean_per_event_regrid_q2t_s']:.4f}s  (quadtree_to_tensor)")
+            print(f"    h2d  = {agg['mean_per_event_regrid_h2d_s']:.4f}s")
+            print(f"    sum  = {substep_sum:.4f}s")
 
 
 if __name__ == "__main__":
