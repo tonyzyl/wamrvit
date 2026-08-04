@@ -34,7 +34,12 @@ def summarize_timing(object_dir, array_dir):
     arr = _read_timing_rows(array_dir, "array")
     obj_total = sum(float(r["seconds"]) for r in obj)
     arr_total = sum(float(r["seconds"]) for r in arr)
-    n_fallback = sum(1 for r in arr if r["backend_used"] == "object")
+    n_object_fallback = sum(1 for r in arr if r["backend_used"] == "object")
+    n_payload_fallback = sum(
+        1 for r in arr
+        if r["backend_used"] == "array" and bool(r.get("fallback_reason"))
+    )
+    n_fallback = n_object_fallback + n_payload_fallback
     obj_rollout = _read_rollout_total(object_dir, "object")
     arr_rollout = _read_rollout_total(array_dir, "array")
     return {
@@ -44,6 +49,8 @@ def summarize_timing(object_dir, array_dir):
         "object_n_calls": len(obj),
         "array_n_calls": len(arr),
         "array_n_fallback": n_fallback,
+        "array_n_object_fallback": n_object_fallback,
+        "array_n_payload_fallback": n_payload_fallback,
         "object_rollout_total_s": obj_rollout,
         "array_rollout_total_s": arr_rollout,
         # regrid as a fraction of total rollout wall-time -> contextualizes the speedup
@@ -103,7 +110,9 @@ def main():
         print(f"  ({100 * t['object_regrid_fraction']:.2f}% of rollout)", end="")
     print()
     print(f"array  regrid: {t['array_total_s']:.4f}s over {t['array_n_calls']} calls "
-          f"({t['array_n_fallback']} fell back to object)", end="")
+          f"({t['array_n_fallback']} fallback(s): "
+          f"{t['array_n_object_fallback']} object, "
+          f"{t['array_n_payload_fallback']} payload)", end="")
     if t["array_regrid_fraction"] is not None:
         print(f"  ({100 * t['array_regrid_fraction']:.2f}% of rollout)", end="")
     print()

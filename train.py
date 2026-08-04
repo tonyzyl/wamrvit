@@ -507,7 +507,6 @@ def main():
     # 5. Create Ray Datasets
     # Turn the list of dicts into a distributed dataset
     ds_train = ray.data.from_items(train_windows)
-    ds_train = ds_train.random_shuffle(seed=config["train"]["seed"])
 
     # 6. Instantiate Loader & Mapper
     file_loader = instantiate_from_config(config["file_loader"])
@@ -529,6 +528,7 @@ def main():
 
     else:
         # single-stage pipeline ---
+        ds_train = ds_train.random_shuffle(seed=config["train"]["seed"])
         train_mapper = Seq2SeqMapper(loader=file_loader, transform=transform)
 
         ds_train = ds_train.map_batches(

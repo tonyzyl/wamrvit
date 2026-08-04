@@ -699,6 +699,12 @@ def apply_two_stage_topology_pipeline(
 
         print(f"{role.capitalize()} topology materialization complete.")
 
+    # Keep the persisted topology cache seed-independent. Apply seed-specific
+    # ordering after loading/building the deterministic topology objects, before
+    # the lazy value-fill stage.
+    if role == "train":
+        ds = ds.random_shuffle(seed=config["train"].get("seed", 42))
+
     # Stage 2: Fill + augment (lazy, re-runs each epoch)
     fill_common_params = filter_valid_kwargs(FillAndExportMapper, fl_params)
     augment = (role == "train")

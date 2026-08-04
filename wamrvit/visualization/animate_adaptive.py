@@ -11,7 +11,12 @@ import torch
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.regrid_dispatch import regrid_native_dispatch, regrid_uniform_dispatch
+from wamrvit.quad.array_regrid_runtime import configure_array_regrid_num_threads
+from wamrvit.quad.regrid_dispatch import (
+    regrid_native_dispatch,
+    regrid_uniform_dispatch,
+    regrid_uniform_sequence_dispatch,
+)
 from wamrvit.quad.quad_utils import (
     tensor_to_quadtree,
     tensor_to_quadtree_native,
@@ -922,6 +927,26 @@ def main():
     regrid_adapt_nearby = config["inference"].get("regrid_adapt_nearby", 0)
     regrid_tol_frac = config["inference"].get("regrid_tol_frac", tol_frac)
     regrid_backend = config["inference"].get("regrid_backend", "object")
+    array_payload_backend = config["inference"].get(
+        "array_regrid_payload_backend", "cpu_eager"
+    )
+    array_value_storage = config["inference"].get(
+        "array_regrid_value_storage", "copy"
+    )
+    array_capacity = int(config["inference"].get("array_regrid_capacity", 8192))
+    if regrid_backend == "array":
+        configure_array_regrid_num_threads(
+            config["inference"].get("array_regrid_num_threads")
+        )
+    detector_channels = adapt_on_channels
+    loader_field_names = list(loader_params.get("field_names", []))
+    selected_detector_channels = detector_channels or list(range(len(loader_field_names)))
+    detector_fields = tuple(
+        loader_field_names[index]
+        if index < len(loader_field_names)
+        else f"channel_{index}"
+        for index in selected_detector_channels
+    )
     pred_mode = config["inference"].get("pred_mode", "target")
     outline_width = float(anim_cfg.get("outline_width", 0.3))
     draw_outlines = bool(anim_cfg.get("draw_outlines", True))
@@ -995,6 +1020,11 @@ def main():
         raise ValueError("Batch has native per-level columns but model.multi_scale_patch is False.")
 
     if is_native_batch:
+        if regrid_backend == "array" and array_payload_backend == "gpu_replay":
+            raise ValueError(
+                "array_regrid_payload_backend=gpu_replay is supported only for "
+                "uniform-patch animation."
+            )
         # Delegate to native rendering path.
         _animate_native(
             model=model,
@@ -1098,13 +1128,6 @@ def main():
                 and timestep_idx % regrid_interval == 0
             ):
                 N, c_in, t_in, h, w = curr_input_seq.shape
-                flat_input = (
-                    curr_input_seq.transpose(1, 2)
-                    .contiguous()
-                    .view(N, t_in * c_in, h, w)
-                    .cpu()
-                    .numpy()
-                )
                 ch_offset = (t_in - 1) * c_in
                 use_channels = (
                     [ch + ch_offset for ch in adapt_on_channels]
@@ -1112,29 +1135,65 @@ def main():
                     else list(range(ch_offset, t_in * c_in))
                 )
 
-                new_input_np, meta = regrid_uniform_dispatch(
-                    flat_input,
-                    meta,
-                    backend=regrid_backend,
-                    max_passes=10,
-                    cell_scale_mode=cell_scale_mode,
-                    tol_frac=regrid_tol_frac,
-                    channel=use_channels,
-                    adapt_nearby=regrid_adapt_nearby,
-                    allow_coarsening=True,
-                )
+                if regrid_backend == "array":
+                    sequence_input = (
+                        curr_input_seq
+                        if array_payload_backend == "gpu_replay"
+                        else curr_input_seq.detach().cpu().numpy()
+                    )
+                    new_sequence, meta = regrid_uniform_sequence_dispatch(
+                        sequence_input,
+                        meta,
+                        backend="array",
+                        max_passes=10,
+                        cell_scale_mode=cell_scale_mode,
+                        tol_frac=regrid_tol_frac,
+                        channel=use_channels,
+                        adapt_nearby=regrid_adapt_nearby,
+                        allow_coarsening=True,
+                        value_storage=array_value_storage,
+                        capacity=array_capacity,
+                        payload_backend=array_payload_backend,
+                        detector_channels=detector_channels,
+                        detector_fields=detector_fields,
+                    )
+                else:
+                    flat_input = (
+                        curr_input_seq.transpose(1, 2)
+                        .contiguous()
+                        .view(N, t_in * c_in, h, w)
+                        .cpu()
+                        .numpy()
+                    )
+                    new_input_np, meta = regrid_uniform_dispatch(
+                        flat_input,
+                        meta,
+                        backend="object",
+                        max_passes=10,
+                        cell_scale_mode=cell_scale_mode,
+                        tol_frac=regrid_tol_frac,
+                        channel=use_channels,
+                        adapt_nearby=regrid_adapt_nearby,
+                        allow_coarsening=True,
+                    )
+                    new_N = new_input_np.shape[0]
+                    new_sequence = np.ascontiguousarray(
+                        new_input_np.reshape(new_N, t_in, c_in, h, w).transpose(
+                            0, 2, 1, 3, 4
+                        )
+                    )
                 centers = torch.from_numpy(meta["centers"]).to(device, dtype=torch.float32)
 
-                new_N = new_input_np.shape[0]
+                new_N = new_sequence.shape[0]
                 print(
                     f"Timestep {timestep_idx}: Regrid triggered - "
                     f"N_grids changed from {curr_input_seq.shape[0]} to {new_N}"
                 )
-                curr_input_seq = torch.from_numpy(
-                    np.ascontiguousarray(new_input_np)
-                    .reshape(new_N, t_in, c_in, h, w)
-                    .transpose(0, 2, 1, 3, 4)
-                ).to(device, dtype=torch.float32)
+                curr_input_seq = (
+                    new_sequence.to(device, dtype=torch.float32)
+                    if isinstance(new_sequence, torch.Tensor)
+                    else torch.from_numpy(new_sequence).to(device, dtype=torch.float32)
+                )
 
             pred_full = model(curr_input_seq, centers)
             if pred_mode == "residual":

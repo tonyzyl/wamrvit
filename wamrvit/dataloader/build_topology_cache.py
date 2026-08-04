@@ -128,9 +128,9 @@ def main():
             return
 
         topo_builder = TopologyBuilder(**topo_builder_params)
+        # Build topology caches in canonical window order. Training applies
+        # seed-specific shuffle after loading/building the cached topology.
         ds = ray.data.from_items(windows)
-        if role == "train":
-            ds = ds.random_shuffle(seed=config["train"].get("seed", 42))
 
         print(f"Building {role} quadtree topologies (Stage 1)...")
         ds = ds.map_batches(

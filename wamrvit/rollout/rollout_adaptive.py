@@ -10,14 +10,17 @@ import numpy as np
 import pandas as pd
 import ray
 import torch
+from numba import get_num_threads
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.dataloader.transform import inverse_transform_src
 from wamrvit.native_train_utils import unpack_native_batch
 from wamrvit.quad.adapt_wavelet import regrid_native
+from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
 from wamrvit.quad.regrid_dispatch import (
     regrid_native_dispatch,
     regrid_uniform_dispatch,
+    regrid_uniform_sequence_dispatch,
     RegridProfiler,
 )
 from wamrvit.quad.quad_utils import (
@@ -219,6 +222,38 @@ class AutoregressivePredictorAdaptive:
             self.regrid_tol_frac = self.tol_frac
 
         self.regrid_backend = inf_cfg.get("regrid_backend", "object")
+        self.array_regrid_value_storage = inf_cfg.get(
+            "array_regrid_value_storage", "copy")
+        self.array_regrid_payload_backend = inf_cfg.get(
+            "array_regrid_payload_backend", "cpu_eager"
+        )
+        if (
+            self.regrid_backend == "array"
+            and self.multi_scale
+            and self.array_regrid_payload_backend == "gpu_replay"
+        ):
+            raise ValueError(
+                "array_regrid_payload_backend=gpu_replay is supported only for "
+                "uniform-patch rollout."
+            )
+        self.array_regrid_capacity = int(inf_cfg.get("array_regrid_capacity", 8192))
+        self.array_regrid_num_threads = inf_cfg.get("array_regrid_num_threads")
+        if self.regrid_backend == "array":
+            configure_array_regrid_num_threads(self.array_regrid_num_threads)
+            print(
+                "Array regrid runtime: "
+                f"value_storage={self.array_regrid_value_storage}, "
+                f"payload_backend={self.array_regrid_payload_backend}, "
+                f"capacity={self.array_regrid_capacity}, "
+                f"numba_threads={get_num_threads()}, "
+                f"affinity_cpus={len(os.sched_getaffinity(0))}"
+            )
+        field_names = list(loader_params.get("field_names", []))
+        detector_channels = self.adapt_on_channels or list(range(len(field_names)))
+        self.regrid_detector_fields = tuple(
+            field_names[index] if index < len(field_names) else f"channel_{index}"
+            for index in detector_channels
+        )
         # Profiling is opt-in (regrid_profile): default object rollouts stay
         # side-effect-free -- no timing CSVs written. Active only for a comparison run.
         self.regrid_profiler = RegridProfiler() if inf_cfg.get("regrid_profile", False) else None
@@ -317,15 +352,6 @@ class AutoregressivePredictorAdaptive:
                     and timestep_idx % self.regrid_interval == 0
                 ):
                     N, c_in, t_in, h, w = curr_input_seq.shape  # (N, C, T_in, Ph, Pw)
-                    # (N, C, T_in, Ph, Pw) → (N, T_in*C, Ph, Pw):
-                    # pack time×channel into one axis for the quadtree.
-                    flat_input = (
-                        curr_input_seq.transpose(1, 2)
-                        .contiguous()
-                        .view(N, t_in * c_in, h, w)
-                        .cpu()
-                        .numpy()
-                    )
                     # Adapt on the last frame's channels (offset into packed T*C axis).
                     ch_offset = (t_in - 1) * c_in
                     use_channels = (
@@ -334,30 +360,69 @@ class AutoregressivePredictorAdaptive:
                         else list(range(ch_offset, t_in * c_in))
                     )
 
-                    new_input_np, meta = regrid_uniform_dispatch(
-                        flat_input,
-                        meta,
-                        backend=self.regrid_backend,
-                        profiler=self.regrid_profiler,
-                        max_passes=10,
-                        cell_scale_mode=self.cell_scale_mode,
-                        tol_frac=self.regrid_tol_frac,
-                        channel=use_channels,
-                        adapt_nearby=self.regrid_adapt_nearby,
-                        allow_coarsening=self.allow_coarsening,
-                    )
-                    # new_input_np: (new_N, T_in*C, Ph, Pw); meta["centers"]: (new_N, 3).
+                    if self.regrid_backend == "array":
+                        # Keep the model's sequence layout and let source storage retain
+                        # initial leaves there instead of copying the full AMReX payload
+                        # into the fixed-capacity mutable workspace.
+                        sequence_input = (
+                            curr_input_seq
+                            if self.array_regrid_payload_backend == "gpu_replay"
+                            else curr_input_seq.detach().cpu().numpy()
+                        )
+                        new_sequence_np, meta = regrid_uniform_sequence_dispatch(
+                            sequence_input,
+                            meta,
+                            backend="array",
+                            profiler=self.regrid_profiler,
+                            max_passes=10,
+                            cell_scale_mode=self.cell_scale_mode,
+                            tol_frac=self.regrid_tol_frac,
+                            channel=use_channels,
+                            adapt_nearby=self.regrid_adapt_nearby,
+                            allow_coarsening=self.allow_coarsening,
+                            value_storage=self.array_regrid_value_storage,
+                            capacity=self.array_regrid_capacity,
+                            payload_backend=self.array_regrid_payload_backend,
+                            detector_channels=self.adapt_on_channels,
+                            detector_fields=self.regrid_detector_fields,
+                        )
+                    else:
+                        # Preserve the established object path exactly: pack time×channel
+                        # into the axis expected by tensor_to_quadtree.
+                        flat_input = (
+                            curr_input_seq.transpose(1, 2)
+                            .contiguous()
+                            .view(N, t_in * c_in, h, w)
+                            .cpu()
+                            .numpy()
+                        )
+                        new_input_np, meta = regrid_uniform_dispatch(
+                            flat_input,
+                            meta,
+                            backend="object",
+                            profiler=self.regrid_profiler,
+                            max_passes=10,
+                            cell_scale_mode=self.cell_scale_mode,
+                            tol_frac=self.regrid_tol_frac,
+                            channel=use_channels,
+                            adapt_nearby=self.regrid_adapt_nearby,
+                            allow_coarsening=self.allow_coarsening,
+                        )
+                        new_N = new_input_np.shape[0]
+                        new_sequence_np = np.ascontiguousarray(
+                            new_input_np.reshape(new_N, t_in, c_in, h, w)
+                            .transpose(0, 2, 1, 3, 4))
+
                     centers = torch.from_numpy(meta["centers"]).to(
                         self.device, dtype=torch.float32
-                    )  # (new_N, 3)
-
-                    new_N = new_input_np.shape[0]
-                    # Unpack T,C and put C first → (new_N, C, T_in, Ph, Pw).
-                    curr_input_seq = torch.from_numpy(
-                        np.ascontiguousarray(new_input_np)
-                        .reshape(new_N, t_in, c_in, h, w)
-                        .transpose(0, 2, 1, 3, 4)
-                    ).to(self.device, dtype=torch.float32)
+                    )
+                    curr_input_seq = (
+                        new_sequence_np.to(self.device, dtype=torch.float32)
+                        if isinstance(new_sequence_np, torch.Tensor)
+                        else torch.from_numpy(new_sequence_np).to(
+                            self.device, dtype=torch.float32
+                        )
+                    )
                 # -------------------------------------
 
                 pred_full = self.model(curr_input_seq, centers)  # (N, C, R, Ph, Pw)

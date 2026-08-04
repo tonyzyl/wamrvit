@@ -3,18 +3,29 @@
 visibility. The single seam through which rollout/animation choose a regrid backend
 for the array-vs-object comparison harness. ``regrid_native_dispatch`` covers the
 multi-scale native path; ``regrid_uniform_dispatch`` covers the uniform-patch path."""
-import csv
 import logging
-import os
 import time
 
+import numpy as np
+
 from wamrvit.quad.adapt_wavelet import regrid, regrid_native
-from wamrvit.quad.array_regrid import warm_array_regrid_kernels, warm_array_regrid_native_kernels
+from wamrvit.quad.array_regrid_native import (
+    array_regrid_native_from_sequence,
+    warm_array_regrid_native_kernels,
+)
+from wamrvit.quad.array_regrid_uniform import (
+    array_regrid_from_sequence,
+    array_regrid_from_tensor,
+    warm_array_regrid_kernels,
+)
+from wamrvit.quad.gpu_regrid_backend import run_gpu_replay_uniform_with_fallback
 from wamrvit.quad.quad_utils import quadtree_to_tensor, tensor_to_quadtree
+from wamrvit.quad.regrid_profiler import RegridProfiler, record_array_status
 
 logger = logging.getLogger(__name__)
 
 VALID_BACKENDS = ("object", "array")
+VALID_ARRAY_PAYLOAD_BACKENDS = ("cpu_eager", "gpu_replay")
 
 
 def _warm_array_from_inputs(by_level, meta, *, C, T):
@@ -50,7 +61,6 @@ def regrid_native_dispatch(by_level, leaf_to_bucket, meta, *,
         return new_by_level, new_l2b, new_meta
 
     # backend == "array"
-    from wamrvit.quad.array_regrid import array_regrid_native_from_sequence
     if profiler is not None and not getattr(profiler, "array_warmed", False):
         _warm_array_from_inputs(by_level, meta, C=regrid_kwargs["C"], T=regrid_kwargs["T"])
         profiler.array_warmed = True
@@ -89,11 +99,169 @@ def _object_uniform_regrid(data, meta, *, cell_scale_mode, tol_frac, channel,
 
 
 def _warm_array_uniform_from_inputs(data):
-    """Prime the uniform numba kernels from the live tensor's shape (packed channel
-    count + patch size), so the first measured array regrid is not charged JIT time."""
+    """Prime the uniform copy-backed kernels from a packed ``(N,T*C,H,W)`` input."""
     warm_array_regrid_kernels(
         flat_channels=int(data.shape[1]),
         patch_size=(int(data.shape[-2]), int(data.shape[-1])))
+
+
+def _warm_array_uniform_sequence_from_inputs(data, *, value_storage):
+    """Prime the sequence-layout kernels used by the source/copy array entry."""
+    warm_array_regrid_kernels(
+        flat_channels=int(data.shape[1]) * int(data.shape[2]),
+        patch_size=(int(data.shape[-2]), int(data.shape[-1])),
+        warm_source=value_storage == "source",
+        warm_copy=value_storage == "copy",
+        output_layout="sequence",
+    )
+
+
+def regrid_uniform_sequence_dispatch(
+    data, meta, *, backend, profiler=None, max_passes=10, cell_scale_mode,
+    tol_frac, channel, adapt_nearby=0, allow_coarsening=True,
+    value_storage="source", capacity=8192, status_collector=None,
+    payload_backend="cpu_eager", detector_channels=None,
+    detector_fields=None,
+):
+    """Run the optimized uniform array backend on ``(N,C,T,H,W)`` sequence data.
+
+    This entry deliberately accepts only ``backend='array'``. The object rollout stays on
+    :func:`regrid_uniform_dispatch` so its established flatten/build/export path remains
+    unchanged. ``value_storage='source'`` keeps initial AMReX leaves in the input sequence
+    instead of copying their ~GiB payload into the fixed-capacity mutable workspace.
+    Output is always sequence layout ``(new_N,C,T,H,W)``.
+    """
+    if backend != "array":
+        raise ValueError(
+            "regrid_uniform_sequence_dispatch only supports backend='array'; "
+            f"got {backend!r}.")
+    if value_storage not in {"source", "copy"}:
+        raise ValueError(
+            f"Unknown array_regrid_value_storage={value_storage!r}; expected 'source' or 'copy'.")
+    if payload_backend not in VALID_ARRAY_PAYLOAD_BACKENDS:
+        raise ValueError(
+            f"Unknown array_regrid_payload_backend={payload_backend!r}; expected one of "
+            f"{VALID_ARRAY_PAYLOAD_BACKENDS}.")
+    if len(data.shape) != 5:
+        raise ValueError(f"Expected sequence shape (N,C,T,H,W), got {data.shape}.")
+
+    if not allow_coarsening:
+        fallback_t0 = time.perf_counter()
+        # The array engine has no refinement-only mode. Preserve the existing explicit
+        # fallback contract and convert the object result back to sequence layout.
+        sequence = data.detach().cpu().numpy() if hasattr(data, "detach") else data
+        sequence = np.asarray(sequence)
+        n, c, t, h, w = sequence.shape
+        flat = np.ascontiguousarray(
+            sequence.transpose(0, 2, 1, 3, 4).reshape(n, t * c, h, w))
+        out, out_meta = regrid_uniform_dispatch(
+            flat, meta, backend="array", profiler=profiler, max_passes=max_passes,
+            cell_scale_mode=cell_scale_mode, tol_frac=tol_frac, channel=channel,
+            adapt_nearby=adapt_nearby, allow_coarsening=False)
+        out_sequence = out.reshape(out.shape[0], t, c, h, w).transpose(0, 2, 1, 3, 4)
+        if status_collector is not None:
+            status_collector.append({
+                "kind": "measured",
+                "complete_regrid_s": time.perf_counter() - fallback_t0,
+                "status": {
+                    "backend": "object",
+                    "fallback_reason": "allow_coarsening_false",
+                    "array_regrid_payload_backend": "cpu_eager",
+                    "gpu_replay_fallback_reason": None,
+                },
+            })
+        return np.ascontiguousarray(out_sequence), out_meta
+
+    entry_kwargs = {
+        "cell_scale_mode": cell_scale_mode,
+        "tol_frac": tol_frac,
+        "channel": channel,
+        "max_passes": max_passes,
+        "adapt_nearby": adapt_nearby,
+        "capacity": capacity,
+        "disable_warnings": True,
+        "output_layout": "sequence",
+        "value_storage": value_storage,
+    }
+    if payload_backend == "gpu_replay":
+        physical_channels = (
+            None if detector_channels is None else tuple(detector_channels)
+        )
+        field_names = None if detector_fields is None else tuple(detector_fields)
+
+        def _gpu_entry():
+            return run_gpu_replay_uniform_with_fallback(
+                data,
+                meta,
+                detector_channels=physical_channels,
+                detector_fields=field_names,
+                cell_scale_mode=cell_scale_mode,
+                tol_frac=tol_frac,
+                channel=channel,
+                max_passes=max_passes,
+                adapt_nearby=adapt_nearby,
+                capacity=capacity,
+                value_storage=value_storage,
+            )
+
+        if profiler is not None and not getattr(profiler, "array_warmed", False):
+            warm_t0 = time.perf_counter()
+            _, _, warm_status = _gpu_entry()
+            warm_dt = time.perf_counter() - warm_t0
+            profiler.exclude_from_sample_total(warm_dt)
+            profiler.array_warmed = True
+            if status_collector is not None:
+                status_collector.append({
+                    "kind": "warmup",
+                    "real_input_warmup_s": warm_dt,
+                    "status": warm_status,
+                })
+        t0 = time.perf_counter()
+        out, out_meta, status = _gpu_entry()
+        dt = time.perf_counter() - t0
+        record_array_status(
+            profiler, status, dt, label="regrid array(gpu replay) backend"
+        )
+        if status_collector is not None:
+            status_collector.append({
+                "kind": "measured", "complete_regrid_s": dt, "status": status
+            })
+        return out, out_meta
+
+    if profiler is not None and not getattr(profiler, "array_warmed", False):
+        synthetic_t0 = time.perf_counter()
+        _warm_array_uniform_sequence_from_inputs(data, value_storage=value_storage)
+        synthetic_dt = time.perf_counter() - synthetic_t0
+        # Synthetic buffers compile common kernels, but production topology can execute
+        # additional lazy Numba branches. Exercise this exact input once and discard the
+        # result so neither JIT nor warm-up execution contaminates measured regrid or
+        # rollout time. The public array entry imports topology into fresh workspaces and
+        # does not mutate ``data`` or ``meta``, so the following measured call sees the
+        # same inputs.
+        warm_t0 = time.perf_counter()
+        _, _, warm_status = array_regrid_from_sequence(data, meta, **entry_kwargs)
+        warm_dt = time.perf_counter() - warm_t0
+        profiler.exclude_from_sample_total(warm_dt)
+        profiler.array_warmed = True
+        if status_collector is not None:
+            status_collector.append({
+                "kind": "warmup",
+                "synthetic_warmup_s": synthetic_dt,
+                "real_input_warmup_s": warm_dt,
+                "status": warm_status,
+            })
+        logger.info(
+            "Untimed real-input array regrid warm-up completed in %.3fs "
+            "(backend=%s, fallback_reason=%s)",
+            warm_dt, warm_status["backend"], warm_status["fallback_reason"])
+    t0 = time.perf_counter()
+    out, out_meta, status = array_regrid_from_sequence(data, meta, **entry_kwargs)
+    dt = time.perf_counter() - t0
+    record_array_status(
+        profiler, status, dt, label="regrid array(uniform sequence) backend")
+    if status_collector is not None:
+        status_collector.append({"kind": "measured", "complete_regrid_s": dt, "status": status})
+    return out, out_meta
 
 
 def regrid_uniform_dispatch(data, meta, *, backend, profiler=None, max_passes=10,
@@ -133,7 +301,6 @@ def regrid_uniform_dispatch(data, meta, *, backend, profiler=None, max_passes=10
         return out, out_meta
 
     # backend == "array"
-    from wamrvit.quad.array_regrid import array_regrid_from_tensor
     if profiler is not None and not getattr(profiler, "array_warmed", False):
         _warm_array_uniform_from_inputs(data)
         profiler.array_warmed = True
@@ -154,62 +321,3 @@ def regrid_uniform_dispatch(data, meta, *, backend, profiler=None, max_passes=10
     if profiler is not None:
         profiler.record(dt, backend_used, fallback_reason)
     return out, out_meta
-
-
-class RegridProfiler:
-    """Accumulates per-regrid-call records across a rollout and writes them to disk.
-    Resident on the (Ray) predictor actor; files are pid-keyed so data-parallel actor
-    replicas do not clobber each other. ``write`` is idempotent-by-rewrite, so calling
-    it once per batch leaves a complete cumulative file at the end."""
-
-    def __init__(self):
-        self.array_warmed = False
-        self._fallback_warned = False
-        self.records = []          # list[dict]
-        self.sample_totals = []    # list[dict]: sample, total_s (rollout wall-time)
-        self._sample = -1
-        self._call = 0
-        self._sample_t0 = None     # perf_counter at current sample start
-
-    def _close_sample(self):
-        """Record the elapsed wall-time of the in-progress sample, if any."""
-        if self._sample_t0 is not None:
-            self.sample_totals.append(
-                {"sample": self._sample, "total_s": time.perf_counter() - self._sample_t0})
-            self._sample_t0 = None
-
-    def new_sample(self):
-        """Call at the start of each rollout trajectory: closes the previous sample's
-        wall-time (if open), advances the sample index, resets the per-sample call index,
-        and stamps the new sample's start time (denominator for regrid-as-%-of-rollout)."""
-        self._close_sample()
-        self._sample += 1
-        self._call = 0
-        self._sample_t0 = time.perf_counter()
-
-    def record(self, seconds, backend_used, fallback_reason):
-        self.records.append({
-            "sample": self._sample if self._sample >= 0 else 0,
-            "call": self._call,
-            "seconds": float(seconds),
-            "backend_used": backend_used,
-            "fallback_reason": "" if fallback_reason is None else str(fallback_reason),
-        })
-        self._call += 1
-
-    def write(self, out_dir, backend):
-        self._close_sample()   # close the in-progress sample so its wall-time is recorded
-        if not self.records:
-            return
-        os.makedirs(out_dir, exist_ok=True)
-        tag = f"{backend}_{os.getpid()}"
-        with open(os.path.join(out_dir, f"regrid_timing_{tag}.csv"), "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=[
-                "sample", "call", "seconds", "backend_used", "fallback_reason"])
-            w.writeheader()
-            w.writerows(self.records)
-        # Rollout wall-time per sample -> denominator for honest "regrid as % of rollout".
-        with open(os.path.join(out_dir, f"regrid_rollout_total_{tag}.csv"), "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["sample", "total_s"])
-            w.writeheader()
-            w.writerows(self.sample_totals)

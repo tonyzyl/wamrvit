@@ -19,9 +19,13 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
+import resource
+import subprocess
 import time
 import warnings
 from contextlib import contextmanager
@@ -29,15 +33,132 @@ from typing import Any
 
 import numpy as np
 import torch
+from numba import get_num_threads
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.native_train_utils import unpack_native_batch
 from wamrvit.quad.adapt_wavelet import regrid
+from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
 from wamrvit.quad.quad_utils import quadtree_to_tensor, tensor_to_quadtree
-from wamrvit.quad.regrid_dispatch import regrid_native_dispatch, regrid_uniform_dispatch
+from wamrvit.quad.regrid_dispatch import (
+    regrid_native_dispatch,
+    regrid_uniform_sequence_dispatch,
+)
 from wamrvit.quad.yt_utils import make_regular_centers
 from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
+
+
+def _git_metadata() -> dict[str, Any]:
+    """Return reproducibility metadata without requiring GitPython."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL
+        ).strip())
+    except (OSError, subprocess.CalledProcessError):
+        commit, dirty = "unknown", None
+    return {"git_commit": commit, "git_dirty": dirty}
+
+
+def _cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
+def _canonical_topology_keys(meta: dict[str, Any]) -> np.ndarray:
+    """Return sorted ``(tile_x,tile_y,level,x,y)`` keys for loader or export metadata."""
+    tiles, xy_idx = _canonical_topology_arrays(meta)
+    keys = np.column_stack((tiles[:, 0], tiles[:, 1], xy_idx[:, 0:3])).astype(np.int64)
+    if keys.size == 0:
+        return keys.reshape(0, 5)
+    order = np.lexsort(tuple(keys[:, i] for i in range(4, -1, -1)))
+    return keys[order]
+
+
+def _topology_fingerprint(meta: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_topology_keys(meta).tobytes()).hexdigest()
+
+
+def _thread_metadata(requested: int | None) -> dict[str, Any]:
+    affinity = sorted(os.sched_getaffinity(0))
+    return {
+        "array_regrid_num_threads_requested": requested,
+        "array_regrid_num_threads_actual": int(get_num_threads()),
+        "affinity_cpu_count": len(affinity),
+        "affinity_cpu_list": affinity,
+    }
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_regrid_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: (
+            value.copy() if isinstance(value, np.ndarray)
+            else dict(value) if isinstance(value, dict)
+            else value
+        )
+        for key, value in meta.items()
+    }
+
+
+def _canonical_topology_arrays(meta: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    if "tiles" in meta and "xy_idx" in meta:
+        return np.asarray(meta["tiles"]), np.asarray(meta["xy_idx"])
+    # Loader metadata predates the array export fields. Use the same importer as
+    # the regrid engine so fixture identity cannot drift from runtime geometry.
+    from wamrvit.quad.array_regrid_geometry import _import_topology_metadata
+
+    top = _import_topology_metadata(
+        len(meta["levels"]), meta, meta.get("cell_scale_mode", "level_idx")
+    )
+    tiles = np.column_stack((top.tile_ix, top.tile_iy)).astype(np.int32)
+    xy_idx = np.column_stack((top.level_idx, top.x_idx, top.y_idx)).astype(np.int32)
+    return tiles, xy_idx
+
+
+def _write_regrid_artifact(
+    path: str, values: np.ndarray, meta: dict[str, Any], status: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Write a comparator-compatible NPZ and return its small manifest record."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+    tiles, xy_idx = _canonical_topology_arrays(meta)
+    artifact_meta = dict(meta)
+    artifact_meta["tiles"], artifact_meta["xy_idx"] = tiles, xy_idx
+    np.savez(
+        path,
+        values=np.asarray(values),
+        tiles=tiles,
+        xy_idx=xy_idx,
+        centers=np.asarray(meta["centers"]),
+        levels=np.asarray(meta["levels"]),
+        domain_json=np.asarray(json.dumps(meta["domain"], sort_keys=True)),
+        status_json=np.asarray(json.dumps(status or {}, sort_keys=True)),
+    )
+    return {
+        "path": os.path.abspath(path),
+        "sha256": _sha256_file(path),
+        "shape": list(np.asarray(values).shape),
+        "dtype": str(np.asarray(values).dtype),
+        "topology_sha256": _topology_fingerprint(artifact_meta),
+    }
 
 
 @contextmanager
@@ -123,12 +244,35 @@ class BenchmarkRunner:
             raise ValueError(
                 f"inference.regrid_backend={self.regrid_backend!r}; expected 'object' or 'array'."
             )
+        self.array_regrid_value_storage = inf_cfg.get(
+            "array_regrid_value_storage", "copy")
+        self.array_regrid_payload_backend = inf_cfg.get(
+            "array_regrid_payload_backend", "cpu_eager"
+        )
+        self.array_regrid_capacity = int(inf_cfg.get("array_regrid_capacity", 8192))
+        self.array_regrid_num_threads = inf_cfg.get("array_regrid_num_threads")
+        if self.regrid_backend == "array":
+            configure_array_regrid_num_threads(self.array_regrid_num_threads)
+            print(
+                "Array regrid runtime: "
+                f"value_storage={self.array_regrid_value_storage}, "
+                f"payload_backend={self.array_regrid_payload_backend}, "
+                f"capacity={self.array_regrid_capacity}, "
+                f"numba_threads={get_num_threads()}, "
+                f"affinity_cpus={len(os.sched_getaffinity(0))}"
+            )
 
         loader_params = config.get("file_loader", {}).get("params", {}) or {}
         self.cell_scale_mode = loader_params.get("cell_scale_mode", "area")
         self.adapt_on_channels = loader_params.get("adapt_on_channels", None)
         self.tol_frac = loader_params.get("tol_frac", 0.01)
         self.regrid_tol_frac = inf_cfg.get("regrid_tol_frac", self.tol_frac)
+        field_names = list(loader_params.get("field_names", []))
+        detector_channels = self.adapt_on_channels or list(range(len(field_names)))
+        self.regrid_detector_fields = tuple(
+            field_names[index] if index < len(field_names) else f"channel_{index}"
+            for index in detector_channels
+        )
 
         if self.variant in ("adaptive_uniform", "adaptive_native"):
             if self.regrid_interval is None:
@@ -154,6 +298,14 @@ class BenchmarkRunner:
         self.warmup_steps = int(b_cfg.get("warmup_steps", 1))
         self.variant_tag = b_cfg.get("variant_tag", self.variant)
         self.dataset_tag = b_cfg.get("dataset_tag", "unknown")
+        self.artifact_dir = b_cfg.get("artifact_dir")
+        configured_artifact_calls = b_cfg.get("artifact_call_indices")
+        self.artifact_call_indices = (
+            {int(call_idx) for call_idx in configured_artifact_calls}
+            if configured_artifact_calls is not None else None
+        )
+        self.artifact_manifest: list[dict[str, Any]] = []
+        self._artifact_fixture_id: tuple[int, int] | None = None
 
     # ------------------------------------------------------------------
     # Sampling: N random windows from the test split, seeded so the same
@@ -277,10 +429,27 @@ class BenchmarkRunner:
     # ------------------------------------------------------------------
 
     def warmup(self, sp: dict[str, Any]):
+        self._synthetic_warmup_durations_s = []
+        if self.variant == "adaptive_uniform" and self.regrid_backend == "array":
+            from wamrvit.quad.array_regrid import warm_array_regrid_kernels
+
+            data = sp["input"]
+            start = time.perf_counter()
+            warm_array_regrid_kernels(
+                flat_channels=int(data.shape[1]) * int(data.shape[2]),
+                patch_size=(int(data.shape[-2]), int(data.shape[-1])),
+                warm_source=self.array_regrid_value_storage == "source",
+                warm_copy=self.array_regrid_value_storage == "copy",
+                output_layout="sequence",
+            )
+            self._synthetic_warmup_durations_s.append(time.perf_counter() - start)
+        self._warmup_durations_s = []
         for _ in range(self.warmup_steps):
+            start = time.perf_counter()
             self._timed_rollout(sp, _is_warmup=True)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            self._warmup_durations_s.append(time.perf_counter() - start)
 
     # ------------------------------------------------------------------
     # Per-trajectory timed rollout.
@@ -298,9 +467,21 @@ class BenchmarkRunner:
         rg_substeps: dict[str, list[float]] = {
             "d2h": [], "t2q": [], "core": [], "q2t": [], "h2d": [],
         }
+        array_regrid_events: list[dict[str, Any]] = []
 
         if self.variant == "adaptive_uniform":
-            self._rollout_uniform(sp, forward_times, regrid_times, n_cells_per_call, rg_substeps)
+            fixture_id = (int(sp.get("traj_idx", -1)), int(sp.get("frame_idx", -1)))
+            capture_artifacts = bool(
+                not _is_warmup
+                and self.artifact_dir
+                and (self._artifact_fixture_id is None or self._artifact_fixture_id == fixture_id)
+            )
+            if capture_artifacts and self._artifact_fixture_id is None:
+                self._artifact_fixture_id = fixture_id
+            self._rollout_uniform(
+                sp, forward_times, regrid_times, n_cells_per_call, rg_substeps,
+                array_regrid_events, capture_artifacts=capture_artifacts,
+            )
         elif self.variant == "adaptive_native":
             self._rollout_native(sp, forward_times, regrid_times, n_cells_per_call, rg_substeps)
         else:  # regular or swin
@@ -318,6 +499,7 @@ class BenchmarkRunner:
             "total_s": float(sum(forward_times) + sum(regrid_times)),
             "mean_num_cells": float(np.mean(n_cells_per_call)) if n_cells_per_call else 0.0,
             "regrid_substeps": rg_substeps,
+            "array_regrid_events": array_regrid_events,
         }
 
     # ----------------- variant kernels -----------------
@@ -329,7 +511,12 @@ class BenchmarkRunner:
         rg_t: list[float],
         n_cells_t: list[int],
         rg_substeps: dict[str, list[float]],
+        array_regrid_events: list[dict[str, Any]] | None = None,
+        *,
+        capture_artifacts: bool = False,
     ):
+        if array_regrid_events is None:
+            array_regrid_events = []
         inputs = sp["input"].clone()
         centers = sp["centers"].clone()
         meta = {
@@ -344,6 +531,7 @@ class BenchmarkRunner:
                 timestep_idx = call_idx * R
                 # --- Regrid block (timed iff a regrid actually happens) ---
                 regrid_block = []
+                artifact_payload = None
                 if (
                     self.regrid_interval is not None
                     and timestep_idx > 0
@@ -352,13 +540,22 @@ class BenchmarkRunner:
                     with _timed(regrid_block):
                         with _timed(rg_substeps["d2h"], sync_cuda=True):
                             N, c_in, t_in, h, w = inputs.shape
-                            flat_input = (
-                                inputs.transpose(1, 2)
-                                .contiguous()
-                                .view(N, t_in * c_in, h, w)
-                                .cpu()
-                                .numpy()
-                            )
+                            if self.regrid_backend == "array":
+                                sequence_input = (
+                                    inputs
+                                    if getattr(
+                                        self, "array_regrid_payload_backend", "cpu_eager"
+                                    ) == "gpu_replay"
+                                    else inputs.detach().cpu().numpy()
+                                )
+                            else:
+                                flat_input = (
+                                    inputs.transpose(1, 2)
+                                    .contiguous()
+                                    .view(N, t_in * c_in, h, w)
+                                    .cpu()
+                                    .numpy()
+                                )
                         ch_offset = (t_in - 1) * c_in
                         use_channels = (
                             [ch + ch_offset for ch in self.adapt_on_channels]
@@ -366,18 +563,55 @@ class BenchmarkRunner:
                             else list(range(ch_offset, t_in * c_in))
                         )
                         if self.regrid_backend == "array":
-                            # Array engine adapts the packed (N, T*C, H, W) tensor
-                            # directly -- no quadtree build/teardown -- so t2q/q2t are
-                            # definitionally zero (eliding them IS the speedup). The whole
-                            # array regrid is timed as "core".
+                            input_meta = _copy_regrid_meta(meta)
                             rg_substeps["t2q"].append(0.0)
                             with _timed(rg_substeps["core"], sync_cuda=False):
-                                new_input_np, meta = regrid_uniform_dispatch(
-                                    flat_input, meta, backend="array", profiler=None,
+                                new_sequence_np, meta = regrid_uniform_sequence_dispatch(
+                                    sequence_input, meta, backend="array", profiler=None,
                                     max_passes=10, cell_scale_mode=self.cell_scale_mode,
                                     tol_frac=self.regrid_tol_frac, channel=use_channels,
                                     adapt_nearby=self.regrid_adapt_nearby,
                                     allow_coarsening=self.allow_coarsening,
+                                    value_storage=self.array_regrid_value_storage,
+                                    capacity=self.array_regrid_capacity,
+                                    status_collector=array_regrid_events,
+                                    payload_backend=getattr(
+                                        self, "array_regrid_payload_backend", "cpu_eager"
+                                    ),
+                                    detector_channels=self.adapt_on_channels,
+                                    detector_fields=getattr(
+                                        self, "regrid_detector_fields", None
+                                    ),
+                                )
+                            measured_events = [
+                                event for event in array_regrid_events
+                                if event.get("kind") == "measured"
+                            ]
+                            if measured_events:
+                                levels, counts = np.unique(
+                                    np.asarray(meta["levels"]), return_counts=True
+                                )
+                                measured_events[-1]["leaf_count"] = int(len(meta["levels"]))
+                                measured_events[-1]["per_level_counts"] = {
+                                    str(int(level)): int(count)
+                                    for level, count in zip(levels, counts)
+                                }
+                            if (
+                                capture_artifacts
+                                and self.artifact_dir
+                                and (
+                                    self.artifact_call_indices is None
+                                    or call_idx in self.artifact_call_indices
+                                )
+                            ):
+                                stem = (
+                                    f"traj{int(sp.get('traj_idx', -1))}_"
+                                    f"frame{int(sp.get('frame_idx', -1))}_call{call_idx}"
+                                )
+                                status = measured_events[-1].get("status", {}) if measured_events else {}
+                                artifact_payload = (
+                                    stem, call_idx, sequence_input, input_meta,
+                                    new_sequence_np, meta, status,
                                 )
                             rg_substeps["q2t"].append(0.0)
                         else:
@@ -399,17 +633,38 @@ class BenchmarkRunner:
                                 new_input_np, meta = quadtree_to_tensor(
                                     qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
                                 )
+                                new_N = new_input_np.shape[0]
+                                new_sequence_np = np.ascontiguousarray(
+                                    new_input_np.reshape(new_N, t_in, c_in, h, w)
+                                    .transpose(0, 2, 1, 3, 4))
                         with _timed(rg_substeps["h2d"], sync_cuda=True):
                             centers = torch.from_numpy(meta["centers"]).to(
                                 self.device, dtype=torch.float32
                             )
-                            new_N = new_input_np.shape[0]
-                            inputs = torch.from_numpy(
-                                np.ascontiguousarray(new_input_np)
-                                .reshape(new_N, t_in, c_in, h, w)
-                                .transpose(0, 2, 1, 3, 4)
-                            ).to(self.device, dtype=torch.float32)
+                            inputs = (
+                                new_sequence_np.to(self.device, dtype=torch.float32)
+                                if isinstance(new_sequence_np, torch.Tensor)
+                                else torch.from_numpy(new_sequence_np).to(
+                                    self.device, dtype=torch.float32
+                                )
+                            )
                 rg_t.append(regrid_block[0] if regrid_block else 0.0)
+                # Artifact I/O is deliberately outside every benchmark timing scope.
+                if artifact_payload is not None:
+                    stem, artifact_call, before, before_meta, after, after_meta, status = artifact_payload
+                    if not self.artifact_manifest:
+                        record = _write_regrid_artifact(
+                            os.path.join(self.artifact_dir, f"{stem}_input.npz"),
+                            before, before_meta,
+                        )
+                        record.update({"kind": "input", "call_idx": artifact_call})
+                        self.artifact_manifest.append(record)
+                    record = _write_regrid_artifact(
+                        os.path.join(self.artifact_dir, f"{stem}_output.npz"),
+                        after, after_meta, status,
+                    )
+                    record.update({"kind": "output", "call_idx": artifact_call})
+                    self.artifact_manifest.append(record)
 
                 # --- Forward block ---
                 n_cells_t.append(int(centers.shape[0]))
@@ -500,35 +755,20 @@ class BenchmarkRunner:
             # regrid + per-level unpack are all timed as "core".
             rg_substeps["t2q"].append(0.0)
             with _timed(rg_substeps["core"], sync_cuda=False):
-                flat_by_level: dict[int, np.ndarray] = {}
-                for lvl, arr in np_by_level.items():
-                    if arr.shape[0] == 0:
-                        flat_by_level[lvl] = arr[:, :0]
-                        continue
-                    n, c, t, h, w = arr.shape
-                    flat_by_level[lvl] = arr.transpose(0, 2, 1, 3, 4).reshape(n, t * c, h, w)
-                new_buckets, new_l2b_np, new_meta = regrid_native_dispatch(
-                    flat_by_level, l2b_np, meta, backend="array", profiler=None,
+                # The array engine consumes and returns the 5-D native buckets
+                # (n, C, T, H, W) directly -- array_regrid_native_from_sequence already
+                # unfolds to 5-D -- so the object branch's pack-to-4-D / unpack scaffolding
+                # does NOT apply here. Mirrors the working rollout usage
+                # (rollout_adaptive.py, regrid_native_dispatch call ~:626): pass np_by_level
+                # straight in, use new_by_level_np straight out.
+                new_by_level_np, new_l2b_np, new_meta = regrid_native_dispatch(
+                    np_by_level, l2b_np, meta, backend="array", profiler=None,
                     max_passes=10, C=C_orig, T=T_in_local, tol_frac=self.regrid_tol_frac,
                     cell_scale_mode=self.cell_scale_mode,
                     adapt_on_channels=self.adapt_on_channels,
                     adapt_nearby=self.regrid_adapt_nearby,
                     allow_coarsening=self.allow_coarsening,
                 )
-                new_by_level_np: dict[int, np.ndarray] = {}
-                for lvl, flat_arr in new_buckets.items():
-                    n_l = flat_arr.shape[0]
-                    if n_l == 0:
-                        h_l = flat_arr.shape[-2] if flat_arr.ndim >= 3 else 0
-                        w_l = flat_arr.shape[-1] if flat_arr.ndim >= 3 else 0
-                        new_by_level_np[lvl] = np.zeros(
-                            (0, C_orig, T_in_local, h_l, w_l), dtype=flat_arr.dtype
-                        )
-                        continue
-                    _, tc, h_l, w_l = flat_arr.shape
-                    new_by_level_np[lvl] = np.ascontiguousarray(
-                        flat_arr.reshape(n_l, T_in_local, C_orig, h_l, w_l).transpose(0, 2, 1, 3, 4)
-                    )
             rg_substeps["q2t"].append(0.0)
         else:
             with _timed(rg_substeps["t2q"], sync_cuda=False):
@@ -638,9 +878,14 @@ class BenchmarkRunner:
             mean_per_call_regrid_only = 0.0
             num_regrid_events_per_traj = 0
 
+        q1, median, q3 = np.percentile(totals, [25, 50, 75])
         agg = {
             "mean_total_s": float(totals.mean()),
             "std_total_s": float(totals.std(ddof=0)),
+            "median_total_s": float(median),
+            "iqr_total_s": float(q3 - q1),
+            "min_total_s": float(totals.min()),
+            "max_total_s": float(totals.max()),
             "mean_forward_s": float(forwards.mean()),
             "std_forward_s": float(forwards.std(ddof=0)),
             "mean_regrid_s": float(regrids.mean()),
@@ -672,6 +917,23 @@ class BenchmarkRunner:
             for k in substep_keys:
                 v = all_vals[k]
                 agg[f"mean_per_event_regrid_{k}_s"] = float(np.mean(v)) if v else 0.0
+
+        array_events = [
+            event for trajectory in per_traj
+            for event in trajectory.get("array_regrid_events", [])
+            if event.get("kind") == "measured"
+        ]
+        if array_events:
+            agg["array_regrid_fallback_count"] = sum(
+                event.get("status", {}).get("backend") != "array" for event in array_events
+            )
+            agg["gpu_replay_fallback_count"] = sum(
+                bool(event.get("status", {}).get("gpu_replay_fallback_reason"))
+                for event in array_events
+            )
+            agg["mean_array_regrid_leaf_count"] = float(np.mean([
+                event.get("leaf_count", 0) for event in array_events
+            ]))
         return agg
 
     def run(self) -> dict[str, Any]:
@@ -695,6 +957,17 @@ class BenchmarkRunner:
             )
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        selected_inputs = [
+            {
+                "traj_idx": int(sp.get("traj_idx", -1)),
+                "frame_idx": int(sp.get("frame_idx", -1)),
+                "input_paths": sp.get("input_paths", []),
+                "topology_sha256": (
+                    _topology_fingerprint(sp["meta"]) if "meta" in sp else None
+                ),
+            }
+            for sp in starting_points
+        ]
         result = {
             "metadata": {
                 "model_variant": self.variant,
@@ -713,6 +986,24 @@ class BenchmarkRunner:
                 "num_forward_calls": self.num_forward_calls,
                 "pred_mode": self.pred_mode,
                 "regrid_tol_frac": self.regrid_tol_frac,
+                "regrid_backend": self.regrid_backend,
+                "array_regrid_value_storage": self.array_regrid_value_storage,
+                "array_regrid_payload_backend": getattr(
+                    self, "array_regrid_payload_backend", "cpu_eager"
+                ),
+                "array_regrid_capacity": self.array_regrid_capacity,
+                **_thread_metadata(self.array_regrid_num_threads),
+                "hostname": platform.node(),
+                "cpu_model": _cpu_model(),
+                "peak_rss_kib": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss),
+                "warmup": {
+                    "synthetic_s": getattr(self, "_synthetic_warmup_durations_s", []),
+                    "real_input_s": getattr(self, "_warmup_durations_s", []),
+                    "measured_s": [float(t["total_s"]) for t in per_traj],
+                },
+                "selected_inputs": selected_inputs,
+                "artifact_manifest": self.artifact_manifest,
+                **_git_metadata(),
             },
             "per_trajectory": per_traj,
             "aggregate": self._aggregate(per_traj),
