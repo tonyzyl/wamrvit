@@ -1,10 +1,11 @@
 """Inference-time benchmark across model variants × datasets.
 
 For one (model_variant × dataset) combo, samples N random test trajectories
-(seeded RNG, t_start=0 each), preloads their starting windows into GPU memory,
-warms up the inference path (njit + cuDNN autotune), then runs `predict_steps`
-autoregressive iterations per trajectory while timing the forward pass and
-regrid block separately. Writes a JSON with per-trajectory and aggregated means.
+(seeded RNG, t_start=0 each), materializes one starting window at a time on the
+GPU, warms up the inference path (njit + cuDNN autotune), then runs
+`predict_steps` autoregressive iterations per trajectory while timing the forward
+pass and regrid block separately. Writes a JSON with per-trajectory timing,
+PyTorch CUDA-memory measurements, and aggregated means/maxima.
 
 No metric computation, no GT loading beyond what the loader emits incidentally,
 no Ray, no DDP. Single-GPU, single-process.
@@ -296,6 +297,7 @@ class BenchmarkRunner:
         self.num_trajectories = int(b_cfg.get("num_trajectories", 10))
         self.seed = int(b_cfg.get("seed", 42))
         self.warmup_steps = int(b_cfg.get("warmup_steps", 1))
+        self.collect_memory = bool(b_cfg.get("collect_memory", True))
         self.variant_tag = b_cfg.get("variant_tag", self.variant)
         self.dataset_tag = b_cfg.get("dataset_tag", "unknown")
         self.artifact_dir = b_cfg.get("artifact_dir")
@@ -353,24 +355,37 @@ class BenchmarkRunner:
         transform = instantiate_from_config(self.config["transform"])
         return Seq2SeqMapper(loader=loader, transform=transform)
 
+    def _materialize_window(
+        self, window: dict[str, Any], mapper: Seq2SeqMapper
+    ) -> dict[str, Any]:
+        """Load one selected window onto the benchmark device.
+
+        Mapping is deliberately outside the timed rollout. ``run`` calls this
+        one window at a time so peak memory represents batch-size-one inference
+        rather than ten simultaneously resident benchmark fixtures.
+        """
+        batch = {
+            "input_paths": [window["input_paths"]],
+            "target_paths": [window["target_paths"]],
+        }
+        mapped = mapper(batch)
+        sp = self._materialize_starting_point(mapped)
+        sp["traj_idx"] = int(window.get("traj_idx", 0))
+        sp["frame_idx"] = int(window.get("frame_idx", 0))
+        sp["input_paths"] = list(window["input_paths"])
+        return sp
+
     def sample_starting_points(self) -> list[dict[str, Any]]:
+        """Materialize all selected fixtures for diagnostic callers.
+
+        The production timing path in ``run`` streams fixtures through
+        ``_materialize_window`` instead. This compatibility method remains for
+        topology diagnostics that intentionally inspect several fixtures.
+        """
         windows = self._build_test_windows()
         chosen = self._pick_test_windows(windows)
         mapper = self._build_mapper()
-
-        starting_points: list[dict[str, Any]] = []
-        for w in chosen:
-            batch = {
-                "input_paths": [w["input_paths"]],
-                "target_paths": [w["target_paths"]],
-            }
-            mapped = mapper(batch)
-            sp = self._materialize_starting_point(mapped)
-            sp["traj_idx"] = int(w.get("traj_idx", 0))
-            sp["frame_idx"] = int(w.get("frame_idx", 0))
-            sp["input_paths"] = list(w["input_paths"])
-            starting_points.append(sp)
-        return starting_points
+        return [self._materialize_window(window, mapper) for window in chosen]
 
     def _materialize_starting_point(self, mapped: dict[str, np.ndarray]) -> dict[str, Any]:
         """Convert mapper output into ready-to-use torch tensors on device.
@@ -904,6 +919,23 @@ class BenchmarkRunner:
             agg["min_num_cells"] = int(per_call_cells.min())
             agg["max_num_cells"] = int(per_call_cells.max())
 
+        # PyTorch CUDA allocator peaks. Each trajectory resets peak statistics
+        # after warmup with exactly one starting window resident. Keep values in
+        # bytes in the JSON; table consumers can choose their display unit.
+        memory_keys = (
+            "torch_cuda_baseline_allocated_bytes",
+            "torch_cuda_peak_allocated_bytes",
+            "torch_cuda_incremental_peak_allocated_bytes",
+            "torch_cuda_baseline_reserved_bytes",
+            "torch_cuda_peak_reserved_bytes",
+        )
+        if all(all(key in t for key in memory_keys) for t in per_traj):
+            for key in memory_keys:
+                values = np.asarray([t[key] for t in per_traj], dtype=np.float64)
+                suffix = key.removeprefix("torch_cuda_")
+                agg[f"mean_torch_cuda_{suffix}"] = float(values.mean())
+                agg[f"max_torch_cuda_{suffix}"] = int(values.max())
+
         # Sub-step breakdown (adaptive variants only). Per-event mean across
         # all regrid events from all trajectories — directly comparable to
         # mean_per_call_regrid_only_s. Sum of substeps ≈ envelope.
@@ -937,37 +969,75 @@ class BenchmarkRunner:
         return agg
 
     def run(self) -> dict[str, Any]:
-        starting_points = self.sample_starting_points()
-        if len(starting_points) == 0:
+        windows = self._pick_test_windows(self._build_test_windows())
+        if len(windows) == 0:
             raise RuntimeError("No starting points sampled.")
-        print(f"Sampled {len(starting_points)} test trajectories. Warming up...")
-        self.warmup(starting_points[0])
-        print(
-            f"Warmup done. Running {len(starting_points)} timed rollouts × "
-            f"{self.predict_steps} steps..."
+        mapper = self._build_mapper()
+        cuda_memory_enabled = bool(
+            self.collect_memory
+            and self.device.type == "cuda"
+            and torch.cuda.is_available()
         )
-        per_traj = []
-        for i, sp in enumerate(starting_points):
-            res = self._timed_rollout(sp)
-            per_traj.append(res)
-            print(
-                f"  [{i + 1}/{len(starting_points)}] traj_idx={res['traj_idx']:>3}  "
-                f"total={res['total_s']:.3f}s  fwd={res['forward_s']:.3f}s  "
-                f"regrid={res['regrid_s']:.3f}s  mean_cells={res['mean_num_cells']:.1f}"
-            )
 
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-        selected_inputs = [
-            {
+        print(f"Sampled {len(windows)} test trajectories. Warming up...")
+        per_traj: list[dict[str, Any]] = []
+        selected_inputs: list[dict[str, Any]] = []
+        for i, window in enumerate(windows):
+            # Keep only one starting window resident. Mapping and H2D transfer
+            # remain outside the forward/regrid timing contract.
+            sp = self._materialize_window(window, mapper)
+            if i == 0:
+                self.warmup(sp)
+                print(
+                    f"Warmup done. Running {len(windows)} timed rollouts × "
+                    f"{self.predict_steps} steps..."
+                )
+
+            if cuda_memory_enabled:
+                torch.cuda.synchronize(self.device)
+                torch.cuda.reset_peak_memory_stats(self.device)
+                baseline_allocated = int(torch.cuda.memory_allocated(self.device))
+                baseline_reserved = int(torch.cuda.memory_reserved(self.device))
+
+            res = self._timed_rollout(sp)
+
+            if cuda_memory_enabled:
+                torch.cuda.synchronize(self.device)
+                peak_allocated = int(torch.cuda.max_memory_allocated(self.device))
+                res.update({
+                    "torch_cuda_baseline_allocated_bytes": baseline_allocated,
+                    "torch_cuda_peak_allocated_bytes": peak_allocated,
+                    "torch_cuda_incremental_peak_allocated_bytes": max(
+                        peak_allocated - baseline_allocated, 0
+                    ),
+                    "torch_cuda_baseline_reserved_bytes": baseline_reserved,
+                    "torch_cuda_peak_reserved_bytes": int(
+                        torch.cuda.max_memory_reserved(self.device)
+                    ),
+                })
+
+            selected_inputs.append({
                 "traj_idx": int(sp.get("traj_idx", -1)),
                 "frame_idx": int(sp.get("frame_idx", -1)),
                 "input_paths": sp.get("input_paths", []),
                 "topology_sha256": (
                     _topology_fingerprint(sp["meta"]) if "meta" in sp else None
                 ),
-            }
-            for sp in starting_points
-        ]
+            })
+            per_traj.append(res)
+            memory_text = (
+                f"  peak_cuda={res['torch_cuda_peak_allocated_bytes'] / 2**30:.2f}GiB"
+                if cuda_memory_enabled else ""
+            )
+            print(
+                f"  [{i + 1}/{len(windows)}] traj_idx={res['traj_idx']:>3}  "
+                f"total={res['total_s']:.3f}s  fwd={res['forward_s']:.3f}s  "
+                f"regrid={res['regrid_s']:.3f}s  "
+                f"mean_cells={res['mean_num_cells']:.1f}{memory_text}"
+            )
+            del sp
+
+        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
         result = {
             "metadata": {
                 "model_variant": self.variant,
@@ -979,6 +1049,17 @@ class BenchmarkRunner:
                 "num_trajectories": self.num_trajectories,
                 "seed": self.seed,
                 "warmup_steps": self.warmup_steps,
+                "collect_memory": self.collect_memory,
+                "cuda_memory_collected": cuda_memory_enabled,
+                "swin_patch_embedding": (
+                    "composed_conv3d" if self.variant == "swin" else None
+                ),
+                "memory_protocol": (
+                    "one starting window resident; torch.cuda peaks reset after warmup "
+                    "before each measured rollout; non-PyTorch CUDA allocations excluded"
+                    if cuda_memory_enabled
+                    else "disabled (collect_memory=false or CUDA unavailable)"
+                ),
                 "device": str(self.device),
                 "gpu_name": gpu_name,
                 "torch_version": torch.__version__,
@@ -1038,6 +1119,12 @@ def main():
     print(f"\nWrote: {out_path}")
     agg = result["aggregate"]
     print(f"  mean_total_s = {agg['mean_total_s']:.3f} ± {agg['std_total_s']:.3f}")
+    if "max_torch_cuda_peak_allocated_bytes" in agg:
+        print(
+            "  peak_cuda_allocated = "
+            f"{agg['max_torch_cuda_peak_allocated_bytes'] / 2**30:.2f} GiB max, "
+            f"{agg['mean_torch_cuda_peak_allocated_bytes'] / 2**30:.2f} GiB mean"
+        )
     if runner.variant in ("adaptive_uniform", "adaptive_native"):
         print(f"  mean_forward_s = {agg['mean_forward_s']:.3f}")
         print(f"  mean_regrid_s = {agg['mean_regrid_s']:.3f}  (frac={agg['frac_regrid']:.1%})")

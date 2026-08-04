@@ -197,6 +197,10 @@ class NRMSE:
         return torch.sqrt(NMSE.eval(x, y, n_spatial_dims, eps=eps, norm_mode=norm_mode))
 
 
+class RelativeL2(NRMSE):
+    """Per-channel relative L2 error, ``||x-y||_2 / ||y||_2``."""
+
+
 class VMSE:
     @staticmethod
     def eval(
@@ -274,7 +278,29 @@ METRIC_REGISTRY = {
     "NMAE": NMAE,
     "NMSE": NMSE,
     "NRMSE": NRMSE,
+    "RelativeL2": RelativeL2,
     "VMSE": VMSE,
     "LInfinity": LInfinity,
     "PearsonR": PearsonR,
 }
+
+
+def eval_per_level_metric(
+    metric_name: str,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate one per-channel metric over leaf tensors ``(N,H,W,C)``.
+
+    Existing cell-space metrics retain the paper's mean-over-leaves protocol.
+    ``RelativeL2`` instead reduces over all leaves and pixels so it equals the
+    conventional per-channel norm ratio on the evaluated level.
+    """
+    metric_cls = METRIC_REGISTRY[metric_name]
+    if metric_name == "RelativeL2":
+        return metric_cls.eval(
+            prediction.unsqueeze(0),
+            target.unsqueeze(0),
+            n_spatial_dims=3,
+        )[0]
+    return metric_cls.eval(prediction, target, n_spatial_dims=2).mean(dim=0)

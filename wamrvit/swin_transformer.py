@@ -49,11 +49,14 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
     """SwinV2 wrapper for spatiotemporal forecasting on regular grids.
 
     Architecture:
-        Input (B, C, T, H, W)
-        -> Tublet Conv3d collapses temporal dim -> (B, tublet_dim, H, W)
-        -> SwinV2 backbone (features_only) -> multi-scale features
+        Input (B, C, T_in, H, W)
+        -> composed temporal-spatial Conv3d -> (B, swin_embed_dim, 1, H0, W0)
+        -> SwinV2 backbone stages (features_only) -> multi-scale features
         -> FPN decoder -> (B, decoder_channels, H0, W0) at stage-0 resolution
-        -> Output head reconstructs full spatial resolution -> (B, C_out, 1, H, W)
+        -> Output head reconstructs -> (B, C_out, T_out, H, W)
+
+    ``patch_size_t`` configures T_in and ``return_seq_len`` configures T_out;
+    both are arbitrary positive construction-time sequence lengths.
 
     Note: timm's SwinV2 creates buffers during __init__ that are incompatible
     with diffusers' meta-device initialization. Use low_cpu_mem_usage=False
@@ -88,6 +91,9 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
         adaptive: bool = False,
     ):
         super().__init__()
+
+        if patch_size_t < 1 or return_seq_len < 1:
+            raise ValueError("patch_size_t (T_in) and return_seq_len (T_out) must be positive.")
 
         out_channels = out_channels or in_channels
         self.out_channels = out_channels
@@ -141,6 +147,146 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
         p_h, p_w = self.patch_size
         self.output_proj = nn.Linear(decoder_channels, out_channels * p_h * p_w * return_seq_len)
 
+        # The temporal tublet and spatial patch projections are adjacent linear
+        # maps, so execute them as one composed Conv3d. During training the
+        # composed tensors remain in the autograd graph; evaluation reuses a
+        # non-persistent cache derived from checkpoint parameters.
+        self.register_buffer("_composed_patch_weight", None, persistent=False)
+        self.register_buffer("_composed_patch_bias", None, persistent=False)
+        self._validate_composed_patch_embed()
+
+    def _validate_composed_patch_embed(self) -> None:
+        patch_proj = self.backbone.patch_embed.proj
+        if not isinstance(patch_proj, nn.Conv2d):
+            raise TypeError("Expected the Swin patch projection to be nn.Conv2d.")
+        if self.tublet_embed.groups != 1 or patch_proj.groups != 1:
+            raise ValueError("Composed Swin patch embedding requires ungrouped convolutions.")
+        if self.tublet_embed.kernel_size != (self.patch_size_t, 1, 1):
+            raise ValueError("Unexpected temporal tublet kernel for composed embedding.")
+        if self.tublet_embed.stride != (self.patch_size_t, 1, 1):
+            raise ValueError("Unexpected temporal tublet stride for composed embedding.")
+        if patch_proj.kernel_size != tuple(self.patch_size):
+            raise ValueError("Unexpected spatial patch kernel for composed embedding.")
+        if patch_proj.stride != tuple(self.patch_size):
+            raise ValueError("Unexpected spatial patch stride for composed embedding.")
+        if patch_proj.in_channels != self.tublet_embed.out_channels:
+            raise ValueError("Temporal and spatial embedding channels do not compose.")
+        if self.tublet_embed.padding != (0, 0, 0) or patch_proj.padding != (0, 0):
+            raise ValueError("Composed Swin patch embedding requires zero padding.")
+        if self.tublet_embed.dilation != (1, 1, 1) or patch_proj.dilation != (1, 1):
+            raise ValueError("Composed Swin patch embedding requires unit dilation.")
+
+    def _clear_composed_patch_cache(self) -> None:
+        self._composed_patch_weight = None
+        self._composed_patch_bias = None
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._clear_composed_patch_cache()
+        return super().train(mode)
+
+    def _apply(self, fn, recurse: bool = True):
+        result = super()._apply(fn, recurse=recurse)
+        self._clear_composed_patch_cache()
+        return result
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        self._clear_composed_patch_cache()
+        result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        self._clear_composed_patch_cache()
+        return result
+
+    def _compose_patch_parameters(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compose checkpoint-compatible factors into one Conv3d kernel."""
+        temporal_weight = self.tublet_embed.weight[:, :, :, 0, 0]
+        temporal_bias = self.tublet_embed.bias
+        patch_proj = self.backbone.patch_embed.proj
+        patch_weight = patch_proj.weight
+        patch_bias = patch_proj.bias
+
+        # Do not let a surrounding BF16 autocast permanently round the factors
+        # while constructing the reusable evaluation cache. Source parameter
+        # dtypes are preserved, and training remains fully differentiable.
+        with torch.autocast(device_type=temporal_weight.device.type, enabled=False):
+            composed_weight = torch.einsum(
+                "oeuv,ect->octuv", patch_weight, temporal_weight
+            ).contiguous()
+            if temporal_bias is None:
+                composed_bias = None if patch_bias is None else patch_bias.clone()
+            else:
+                temporal_contribution = torch.einsum(
+                    "oeuv,e->o", patch_weight, temporal_bias
+                )
+                composed_bias = (
+                    temporal_contribution
+                    if patch_bias is None
+                    else patch_bias + temporal_contribution
+                )
+                composed_bias = composed_bias.contiguous()
+        return composed_weight, composed_bias
+
+    def _get_composed_patch_parameters(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.training:
+            # Recompute every training forward: caching would retain an obsolete
+            # autograd graph after the optimizer updates the factor parameters.
+            return self._compose_patch_parameters()
+        if self._composed_patch_weight is None:
+            with torch.no_grad():
+                weight, bias = self._compose_patch_parameters()
+            self._composed_patch_weight = weight
+            self._composed_patch_bias = bias
+        return self._composed_patch_weight, self._composed_patch_bias
+
+    def _forward_backbone_composed(self, x_tokens: torch.Tensor) -> list[torch.Tensor]:
+        if x_tokens.ndim != 5:
+            raise ValueError(
+                "SwinV2 expects input shape (B,C,T_in,H,W); "
+                f"got {tuple(x_tokens.shape)}."
+            )
+        if x_tokens.shape[2] != self.patch_size_t:
+            raise ValueError(
+                "SwinV2 was configured for "
+                f"T_in={self.patch_size_t}, but received T_in={x_tokens.shape[2]}. "
+                "Set patch_size_t to the desired input sequence length."
+            )
+
+        patch_embed = self.backbone.patch_embed
+        height, width = x_tokens.shape[-2:]
+        if patch_embed.dynamic_img_pad:
+            raise ValueError("Composed Swin patch embedding does not support dynamic padding.")
+        if patch_embed.img_size is not None and patch_embed.strict_img_size:
+            if (height, width) != tuple(patch_embed.img_size):
+                raise ValueError(
+                    f"Expected input size {tuple(patch_embed.img_size)}, got {(height, width)}."
+                )
+        p_h, p_w = self.patch_size
+        if height % p_h != 0 or width % p_w != 0:
+            raise ValueError(
+                f"Input size {(height, width)} is not divisible by patch size {(p_h, p_w)}."
+            )
+
+        weight, bias = self._get_composed_patch_parameters()
+        x = F.conv3d(
+            x_tokens,
+            weight,
+            bias,
+            stride=(self.patch_size_t, p_h, p_w),
+        )
+        if x.shape[2] != 1:
+            raise RuntimeError(f"Expected one temporal output, got shape {tuple(x.shape)}.")
+
+        # timm Swin stages consume channels-last tensors after PatchEmbed norm.
+        x = x.squeeze(2).permute(0, 2, 3, 1)
+        x = patch_embed.norm(x)
+        features = []
+        for name, module in self.backbone.items():
+            if name == "patch_embed":
+                continue
+            x = module(x)
+            if name in self.backbone.return_layers:
+                features.append(x)
+        return features
+
     def forward(
         self,
         x_tokens: torch.Tensor,
@@ -153,12 +299,10 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
         """
         B, C, T, H, W = x_tokens.shape
 
-        # 1. Tublet embed: collapse temporal dim
-        x = self.tublet_embed(x_tokens)  # (B, tublet_dim, T', H, W)
-        x = x.squeeze(2)  # (B, tublet_dim, H, W) assuming T'=1
-
-        # 2. SwinV2 backbone: multi-scale features
-        features = self.backbone(x)
+        # 1--2. Collapse the configured input sequence and spatially patchify
+        # with one composed Conv3d. T_in and T_out are independent constructor
+        # parameters; neither is hard-coded to the paper's 2-to-1 setting.
+        features = self._forward_backbone_composed(x_tokens)
         # Only keep the stages we have decoder laterals for
         num_stages = len(self.decoder.lateral_convs)
         features = features[:num_stages]

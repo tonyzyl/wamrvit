@@ -36,7 +36,7 @@ from wamrvit.quad.quad_utils import (
 )
 from wamrvit.quad.yt_utils import make_regular_centers
 from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.rollout.regular_metrics import METRIC_REGISTRY
+from wamrvit.rollout.regular_metrics import METRIC_REGISTRY, eval_per_level_metric
 from wamrvit.rollout.rollout_adaptive import (
     build_native_gt_buckets,
     eval_native_uniform_metrics,
@@ -1013,11 +1013,8 @@ class CombinedMetricEvaluator:
                     results[f"step_{step}_level_{lvl}_count"][0] = float(np.sum(mask))
 
                     for metric_name in self.metric_names:
-                        metric_cls = METRIC_REGISTRY[metric_name]
-                        val_adap = metric_cls.eval(adap_t, gt_t, n_spatial_dims=2).mean(
-                            dim=0
-                        )  # (C,)
-                        val_reg = metric_cls.eval(reg_t, gt_t, n_spatial_dims=2).mean(dim=0)  # (C,)
+                        val_adap = eval_per_level_metric(metric_name, adap_t, gt_t)  # (C,)
+                        val_reg = eval_per_level_metric(metric_name, reg_t, gt_t)  # (C,)
                         for c_idx in range(len(self.fields)):
                             results[
                                 f"step_{step}_level_{lvl}_{metric_name}_adaptive_{self.fields[c_idx]}"

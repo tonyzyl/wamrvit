@@ -32,7 +32,7 @@ from wamrvit.quad.quad_utils import (
     tensor_to_uniform_native,
 )
 from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.rollout.regular_metrics import METRIC_REGISTRY
+from wamrvit.rollout.regular_metrics import METRIC_REGISTRY, eval_per_level_metric
 from wamrvit.utils import instantiate_from_config, load_config
 
 # ---------------------------------------------------------------------------
@@ -114,8 +114,7 @@ def eval_per_level_metrics(
         gt_t = torch.from_numpy(gt_frame).permute(0, 2, 3, 1).float()
 
         for metric_name in metric_names:
-            metric_cls = METRIC_REGISTRY[metric_name]
-            val = metric_cls.eval(pred_t, gt_t, n_spatial_dims=2).mean(dim=0)
+            val = eval_per_level_metric(metric_name, pred_t, gt_t)
             for c in range(C):
                 results[f"step_{step}_level_{lvl}_{metric_name}_{key_prefix}{fields[c]}"][0] = val[
                     c
@@ -914,8 +913,7 @@ class MetricEvaluator:
                     results[f"step_{step}_level_{lvl}_count"][b] = float(np.sum(mask))
 
                     for metric_name in self.metrics:
-                        metric_cls = METRIC_REGISTRY[metric_name]
-                        val = metric_cls.eval(pred_t, gt_t, n_spatial_dims=2).mean(dim=0)  # (C,)
+                        val = eval_per_level_metric(metric_name, pred_t, gt_t)  # (C,)
                         for c in range(C):
                             key = f"step_{step}_level_{lvl}_{metric_name}_{self.fields[c]}"
                             results[key][b] = val[c].item()
