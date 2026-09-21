@@ -75,8 +75,23 @@ def precompute_mean_std(normalization_param_dict: Dict, variable_names: Optional
         return np.array(mean_list, dtype=np.float32), np.array(std_list, dtype=np.float32)
 
 
+def parse_frame_indices(
+    file_paths: List[str],
+    filename_pattern: str = r".*id(\d+).*idx(\d+).*\.npz",
+) -> np.ndarray:
+    """Extract the frame index (2nd capture group) from each path in a single trajectory."""
+    pattern = re.compile(filename_pattern)
+    ids = []
+    for p in file_paths:
+        m = pattern.search(p)
+        if m is None:
+            raise ValueError(f"Path {p!r} does not match filename_pattern {filename_pattern!r}")
+        ids.append(int(m.group(2)))
+    return np.asarray(ids, dtype=np.int64)
+
+
 def group_and_sort_files(
-    file_list: List[str], 
+    file_list: List[str],
     filename_pattern: str = r".*id(\d+).*idx(\d+).*\.npz"
 ) -> List[List[str]]:
     """

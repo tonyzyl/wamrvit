@@ -657,13 +657,26 @@ class QuadTreeTransformer(
             tokens, leaf_to_bucket, bucket_sizes
         )  # {lvl: (N_l, C_out, R, H_l, W_l)}
 
-    def forward(self, x_tokens: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x_tokens: torch.Tensor | dict[int, torch.Tensor],
+        centers: torch.Tensor,
+        *,
+        leaf_to_bucket: torch.Tensor | None = None,
+    ) -> torch.Tensor | dict[int, torch.Tensor]:
         """
         x_tokens: (N, C, T, Ph, Pw) adaptive — one leaf per token, uniform-patch mode.
                   (B, C, T, H,  W)  regular  — full-grid mode.
+                  {level: (N_l, C, T, H_l, W_l)} native — requires leaf_to_bucket.
+        Native training enters here so the DDP wrapper can prepare gradient reduction.
         centers:  (N, 3), storing (cx, cy, cell_scale_val).
-        Returns:  (N, C_out, R, Ph, Pw) adaptive, or (B, C_out, R, H, W) regular.
+        Returns:  (N, C_out, R, Ph, Pw) adaptive, (B, C_out, R, H, W) regular,
+                  or per-level native predictions.
         """
+        if isinstance(x_tokens, dict):
+            if leaf_to_bucket is None:
+                raise ValueError("Native forward requires leaf_to_bucket.")
+            return self.forward_multi_scale(x_tokens, leaf_to_bucket, centers)
         if self.adaptive:
             N, C, T, H, W = x_tokens.shape  # H == Ph, W == Pw
             assert H == self.patch_size[0] and W == self.patch_size[1], (
@@ -729,6 +742,23 @@ class QuadTreeTransformer(
             return x_tokens
 
 
+def _project_tubelet(projection: nn.Conv3d, x: torch.Tensor) -> torch.Tensor:
+    """Retain fast CUDA Conv3d dispatch without changing trainable parameters.
+
+    BF16 NCDHW inputs can select a slow fallback on PyTorch 2.9/cuDNN 9.10.
+    Use an activation-only layout change; leave CPU execution,
+    parameter objects/layouts, initialization, and checkpoint keys untouched.
+    """
+    if x.is_cuda and x.ndim in (4, 5):
+        unbatched = x.ndim == 4
+        if unbatched:
+            x = x.unsqueeze(0)
+        x = x.to(memory_format=torch.channels_last_3d)
+        out = projection(x)
+        return out.squeeze(0) if unbatched else out
+    return projection(x)
+
+
 class PatchEmbed(nn.Module):
     def __init__(
         self,
@@ -744,7 +774,7 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.proj(hidden_states)  # -> (B, C, T/p_t, H/p_h, W/p_w)
+        hidden_states = _project_tubelet(self.proj, hidden_states)  # -> (B, C, T/p_t, H/p_h, W/p_w)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)  # BCTHW -> BNC
         return hidden_states
 
@@ -907,9 +937,9 @@ class MultiScalePatchEmbed(nn.Module):
             x = self.shrink_cascades[lvl](bucket)  # (N_l, C*m^d, p_t, Ph, Pw)
             if self.shared_finest:
                 x = self.reducers[lvl](x)  # (N_l, C, p_t, Ph, Pw); Identity at d=0
-                out = self.proj_shared(x)  # (N_l, D, 1, 1, 1)
+                out = _project_tubelet(self.proj_shared, x)  # (N_l, D, 1, 1, 1)
             else:
-                out = self.projs[lvl](x)  # (N_l, D, 1, 1, 1)
+                out = _project_tubelet(self.projs[lvl], x)  # (N_l, D, 1, 1, 1)
             out = out.flatten(1)  # (N_l, D)
             # Scatter N_l bucket tokens into their positions in the flat (N, D) sequence.
             mask = leaf_to_bucket[:, 0] == lvl  # (N,) bool

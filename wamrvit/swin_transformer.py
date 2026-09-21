@@ -1,8 +1,8 @@
 """SwinV2 baseline wrapper for regular-grid spatiotemporal forecasting.
 
 Uses a timm SwinV2 backbone with a tublet Conv3d for temporal collapse and
-a lightweight FPN decoder for spatial reconstruction. Compatible with the
-existing diffusers save_pretrained/from_pretrained checkpointing.
+a refined FPN decoder for spatial reconstruction. Compatible with diffusers
+save_pretrained/from_pretrained checkpointing.
 """
 
 from __future__ import annotations
@@ -13,34 +13,66 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from timm.models.convnext import ConvNeXtBlock
 
 
 class FPNDecoder(nn.Module):
-    """Simple Feature Pyramid Network decoder.
+    """Refined Feature Pyramid Network decoder.
 
     Takes multi-scale feature maps from the backbone, projects each to a
-    common channel dimension, then progressively upsamples and adds coarser
-    features into finer ones.
+    common channel dimension, refines every non-bottleneck skip with ConvNeXt
+    blocks, and applies a learned spatial correction after each bilinear
+    upsampling operation before fusion.
     """
 
-    def __init__(self, in_channels_list: list[int], out_channels: int):
+    def __init__(
+        self,
+        in_channels_list: list[int],
+        out_channels: int,
+        refinement_blocks: int = 2,
+    ):
         super().__init__()
+        if refinement_blocks < 1:
+            raise ValueError("refinement_blocks must be positive.")
+
         self.lateral_convs = nn.ModuleList(
             [nn.Conv2d(in_ch, out_channels, 1) for in_ch in in_channels_list]
         )
+        self.skip_refiners = nn.ModuleList(
+            [
+                nn.Sequential(
+                    *[ConvNeXtBlock(out_channels) for _ in range(refinement_blocks)]
+                )
+                for _ in in_channels_list[:-1]
+            ]
+        )
+        self.upsample_convs = nn.ModuleList(
+            [
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+                for _ in in_channels_list[:-1]
+            ]
+        )
+        for conv in self.upsample_convs:
+            nn.init.dirac_(conv.weight)
+            if conv.bias is not None:
+                nn.init.zeros_(conv.bias)
 
     def forward(self, features: list[torch.Tensor]) -> torch.Tensor:
         # Project all stages to decoder dim
         laterals = [conv(f) for conv, f in zip(self.lateral_convs, features)]
 
-        # Top-down pathway: progressively upsample coarser and add to finer
+        # Top-down pathway: refine each skip and learn a spatial correction
+        # after bilinear upsampling before fusing the two feature maps.
         for i in range(len(laterals) - 1, 0, -1):
-            laterals[i - 1] = laterals[i - 1] + F.interpolate(
+            upsampled = F.interpolate(
                 laterals[i],
                 size=laterals[i - 1].shape[2:],
                 mode="bilinear",
                 align_corners=False,
             )
+            upsampled = self.upsample_convs[i - 1](upsampled)
+            skip = self.skip_refiners[i - 1](laterals[i - 1])
+            laterals[i - 1] = skip + upsampled
 
         return laterals[0]  # finest resolution
 
@@ -80,13 +112,14 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
         patch_size_t: int = 2,
         # SwinV2 backbone config
         swin_embed_dim: int = 192,
-        swin_depths: list[int] | tuple[int, ...] = (2, 2, 18),
-        swin_num_heads: list[int] | tuple[int, ...] = (6, 12, 24),
+        swin_depths: list[int] | tuple[int, ...] = (8, 12, 12, 6),
+        swin_num_heads: list[int] | tuple[int, ...] = (6, 12, 24, 48),
         swin_window_size: int = 4,
         swin_pretrained: bool = False,
         img_size: list[int] | tuple[int, int] = (1120, 400),
         # Decoder
         decoder_channels: int = 256,
+        decoder_refinement_blocks: int = 2,
         # Kept for config compat with training script but unused
         adaptive: bool = False,
     ):
@@ -135,8 +168,13 @@ class SwinV2Transformer(ModelMixin, ConfigMixin):
         num_stages = len(swin_depths)
         stage_channels = stage_channels[:num_stages]
 
-        # FPN decoder
-        self.decoder = FPNDecoder(stage_channels, decoder_channels)
+        # Refined FPN decoder: ConvNeXt-processed skips and learned spatial
+        # correction after each bilinear upsampling operation.
+        self.decoder = FPNDecoder(
+            stage_channels,
+            decoder_channels,
+            refinement_blocks=decoder_refinement_blocks,
+        )
 
         # Output head: upsample from stage-0 resolution back to full spatial
         # Stage 0 resolution = H / patch_size[0], W / patch_size[1] (swin's

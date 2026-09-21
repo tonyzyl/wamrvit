@@ -10,6 +10,7 @@ from typing import Any, Optional, List, Callable, Dict, Union
 
 from wamrvit.quad.quadtree import TreeDiff
 from wamrvit.dataloader.transform import apply_transform_src
+from wamrvit.dataloader.utils import parse_frame_indices
 
 
 def generate_multi_trajectory_windows(
@@ -17,7 +18,8 @@ def generate_multi_trajectory_windows(
     input_seq_len: int,
     return_seq_len: int,
     interval_between_pred: int = 1,
-    sampling_interval: int = 1
+    sampling_interval: int = 1,
+    filename_pattern: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Iterates over multiple trajectories, subsamples them, validates length,
@@ -29,12 +31,18 @@ def generate_multi_trajectory_windows(
         return_seq_len: Number of target frames.
         interval_between_pred: Step size between frames in a sequence.
         sampling_interval: Step size to subsample the raw file list.
+        filename_pattern: If set, parse frame indices from filenames and skip
+            windows whose selected frames are not strided-contiguous. Use to
+            reject windows that span mid-trajectory gaps (e.g., PLI dataset).
+            Defaults to None, preserving the positional-index behavior for
+            AMReX/HDF5/legacy callers.
     """
     all_windows = []
-    
+    expected_step = interval_between_pred * sampling_interval
+
     # 1. Iterate over each trajectory
     for traj_idx, file_paths in enumerate(file_path_list):
-        
+
         # A. Apply Downsampling (Outer Stride)
         if sampling_interval > 1:
             files_to_use = file_paths[::sampling_interval]
@@ -54,30 +62,45 @@ def generate_multi_trajectory_windows(
                           f"Found: {len(files_to_use)}. Skipping.")
             continue
 
+        # If gap detection is enabled, parse frame ids once per trajectory.
+        frame_ids = parse_frame_indices(files_to_use, filename_pattern) if filename_pattern else None
+        n_skipped_due_to_gap = 0
+
         # D. Generate Windows for this specific trajectory
         # We can reuse the logic from the single-trajectory generator here
         # or inline it for clarity. Here is the inlined logic:
-        
+
         num_valid_starts = len(files_to_use) - seq_span + 1
-        
+
         for idx in range(num_valid_starts):
             # Calculate indices RELATIVE to this trajectory's file list
             input_end_idx = idx + (input_seq_len - 1) * interval_between_pred
             pred_start_idx = input_end_idx + interval_between_pred
-            
+
             input_indices = range(idx, input_end_idx + 1, interval_between_pred)
-            
+
             target_stop_idx = pred_start_idx + (return_seq_len - 1) * interval_between_pred + 1
             target_indices = range(pred_start_idx, target_stop_idx, interval_between_pred)
-            
+
+            if frame_ids is not None:
+                window_positions = list(input_indices) + list(target_indices)
+                window_ids = frame_ids[window_positions]
+                if not np.all(np.diff(window_ids) == expected_step):
+                    n_skipped_due_to_gap += 1
+                    continue
+
             # Create the Manifest Row
             row = {
                 "input_paths": [files_to_use[i] for i in input_indices],
                 "target_paths": [files_to_use[i] for i in target_indices],
-                "traj_idx": traj_idx, 
+                "traj_idx": traj_idx,
                 "frame_idx": idx
             }
             all_windows.append(row)
+
+        if n_skipped_due_to_gap > 0:
+            warnings.warn(f"Trajectory {traj_idx}: skipped {n_skipped_due_to_gap} "
+                          f"window(s) that cross missing frames.")
 
     return all_windows
 
@@ -86,47 +109,65 @@ def generate_ar_windows(
     input_seq_len: int,
     return_seq_len: int,
     interval_between_pred: int = 1,
-    sampling_interval: int = 1
+    sampling_interval: int = 1,
+    filename_pattern: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Creates a list of dictionaries. Each dictionary defines ONE training sample
     (a specific set of input files and target files).
 
     Args:
-        file_path_list ('List[str]'): 
+        file_path_list ('List[str]'):
             List of file paths to load from (sorted).
+        filename_pattern: If set, parse frame indices from filenames and skip
+            windows whose selected frames are not strided-contiguous. Defaults
+            to None (positional-index behavior preserved).
     """
-    
+
     full_seq_len = (input_seq_len + return_seq_len - 1) * interval_between_pred + 1
+    expected_step = interval_between_pred * sampling_interval
 
     if sampling_interval > 1:
         files_to_use = file_path_list[::sampling_interval]
     else:
         files_to_use = file_path_list
-        
+
     total_files = len(files_to_use)
-    
+    frame_ids = parse_frame_indices(files_to_use, filename_pattern) if filename_pattern else None
+    n_skipped_due_to_gap = 0
+
     windows = []
-    
+
     for idx in range(total_files - full_seq_len + 1):
         # Iterate through valid start indices
         input_end_idx = idx + (input_seq_len - 1) * interval_between_pred
         pred_start_idx = input_end_idx + interval_between_pred
-        
+
         input_indices = range(idx, input_end_idx + 1, interval_between_pred)
-        
+
         target_stop_idx = pred_start_idx + (return_seq_len - 1) * interval_between_pred + 1
         target_indices = range(pred_start_idx, target_stop_idx, interval_between_pred)
-        
+
+        if frame_ids is not None:
+            window_positions = list(input_indices) + list(target_indices)
+            window_ids = frame_ids[window_positions]
+            if not np.all(np.diff(window_ids) == expected_step):
+                n_skipped_due_to_gap += 1
+                continue
+
         # store the actual PATHS
         row = {
             "input_paths": [files_to_use[i] for i in input_indices],
             "target_paths": [files_to_use[i] for i in target_indices],
             "traj_idx": 0,
-            "frame_idx": idx 
+            "frame_idx": idx
         }
         windows.append(row)
-        
+
+    if n_skipped_due_to_gap > 0:
+        warnings.warn(f"AR trajectory: skipped {n_skipped_due_to_gap} window(s) "
+                      f"that cross missing frames.")
+
     return windows
 
 

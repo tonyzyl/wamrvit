@@ -2,17 +2,18 @@ import argparse
 import math
 import os
 import time
+import warnings
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.quad.yt_utils import make_regular_centers
 from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
+from wamrvit.visualization import anim_style
 from wamrvit.visualization.plotting import compute_vrange
 
 
@@ -48,24 +49,66 @@ def _resolve_anim_channels(anim_cfg, field_names):
     return [(f, i) for i, f in enumerate(field_names)]
 
 
-def save_single_gif(seq, T, title_prefix, vmin, vmax, filename, dpi=150, fps=4):
+def _parse_save_at_indices(args, config, anim_cfg, predict_steps):
+    """Parse user-requested snapshot indices (1-based) for PNG export."""
+    raw = args.save_at
+    if raw is None:
+        raw = anim_cfg.get("save_at", None)
+    if raw is None:
+        raw = config.get("save_at", None)
+    if raw is None:
+        return []
+
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        cleaned = cleaned.replace("[", "").replace("]", "")
+        tokens = [tok for tok in cleaned.replace(",", " ").split() if tok]
+        values = [int(tok) for tok in tokens]
+    elif isinstance(raw, (int, np.integer)):
+        values = [int(raw)]
+    else:
+        values = [int(v) for v in list(raw)]
+
+    save_at = []
+    seen = set()
+    for idx in values:
+        if idx in seen:
+            continue
+        seen.add(idx)
+        if 1 <= idx <= predict_steps:
+            save_at.append(idx)
+        else:
+            warnings.warn(
+                f"Ignoring save_at={idx}: valid range is [1, {predict_steps}] for this rollout."
+            )
+    return save_at
+
+
+def save_single_frame_png(frame_arr, title, vmin, vmax, filename, *, aspect, dpi=150, show_axes=True):
+    """Render a single regular-grid frame to PNG using imshow."""
+    fig, ax, cax = anim_style.make_aligned_figure(aspect, dpi, show_axes=show_axes)
+    im = ax.imshow(frame_arr, origin="lower", cmap="jet", aspect="equal", vmin=vmin, vmax=vmax)
+    fig.colorbar(im, cax=cax)
+    anim_style.finalize_axes(ax, title=title, show_axes=show_axes)
+    fig.savefig(filename, dpi=dpi)
+    plt.close(fig)
+
+
+def save_single_gif(seq, T, title_prefix, vmin, vmax, filename, *, aspect, dpi=150, fps=4, show_axes=True):
     """Renders a regular-grid sequence to a GIF using imshow."""
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
+    fig, ax, cax = anim_style.make_aligned_figure(aspect, dpi, show_axes=show_axes)
 
     im = ax.imshow(seq[0], origin="lower", cmap="jet", aspect="equal", vmin=vmin, vmax=vmax)
-    ax.axis("off")
-
-    div = make_axes_locatable(ax)
-    cax = div.append_axes("right", size="5%", pad=0.1)
-    plt.colorbar(im, cax=cax)
+    fig.colorbar(im, cax=cax)
 
     def update(frame):
-        ax.set_title(f"{title_prefix} (Frame {frame})", fontsize=16, pad=15)
         im.set_data(seq[frame])
+        anim_style.finalize_axes(
+            ax, title=f"{title_prefix} (Frame {frame})", show_axes=show_axes
+        )
         return [im]
 
     anim = animation.FuncAnimation(fig, update, frames=T, blit=False)
-    fig.tight_layout()
     anim.save(filename, writer="pillow", fps=fps, dpi=dpi)
     plt.close(fig)
 
@@ -80,6 +123,29 @@ def main():
     )
     parser.add_argument("--traj_idx", type=int, required=True, help="Trajectory index to animate.")
     parser.add_argument("--frame_idx", type=int, required=True, help="Frame index to animate.")
+    parser.add_argument(
+        "--save_at",
+        type=str,
+        default=None,
+        help="1-based snapshot indices to save as PNG (e.g., '25' or '10,25,40').",
+    )
+    parser.add_argument(
+        "--display_name",
+        type=str,
+        default="Pred",
+        help="Title prefix for the prediction frames (e.g., 'WAMRViT', 'ViT-finest').",
+    )
+    parser.add_argument(
+        "--gt_display_name",
+        type=str,
+        default="GT",
+        help="Title prefix for the ground-truth frames.",
+    )
+    parser.add_argument(
+        "--png_only",
+        action="store_true",
+        help="Skip GIF rendering; only emit the --save_at snapshot PNGs.",
+    )
     args, unknown = parser.parse_known_args()
 
     config = load_config(args, unknown)
@@ -95,6 +161,16 @@ def main():
     os.makedirs(anim_dir, exist_ok=True)
     anim_dpi = anim_cfg.get("dpi", 150)
     anim_fps = anim_cfg.get("fps", 4)
+    show_axes = anim_cfg.get("show_axes", True)
+
+    def _parse_plot_frac(cfg):
+        pf = cfg.get("plot_frac", None)
+        if pf is None:
+            return cfg.get("x_frac", None), cfg.get("y_frac", None)
+        # plot_frac = [x0, x1, y0, y1]
+        return (float(pf[0]), float(pf[1])), (float(pf[2]), float(pf[3]))
+
+    x_frac, y_frac = _parse_plot_frac(anim_cfg)
 
     model_name = config["inference"]["checkpoint_path"].split("/")[-2]
 
@@ -248,6 +324,9 @@ def main():
     anim_start_time = time.time()
 
     anim_pairs = _resolve_anim_channels(anim_cfg, data_config["field_names"])
+    save_at_indices = _parse_save_at_indices(args, config, anim_cfg, T_total)
+    if save_at_indices:
+        print(f"Additional snapshots requested at (1-based): {save_at_indices}")
 
     # Use first batch element (b=0)
     for field, c_idx in anim_pairs:
@@ -256,6 +335,15 @@ def main():
         # Extract (T, H, W) sequences for the chosen field and batch element 0
         pred_seq = pred_full[0, c_idx]  # (T_total, H, W)
         gt_seq = gt_full[0, c_idx]  # (T_total, H, W)
+
+        pred_seq = anim_style.crop_to_frac(pred_seq, x_frac=x_frac, y_frac=y_frac)
+        gt_seq = anim_style.crop_to_frac(gt_seq, x_frac=x_frac, y_frac=y_frac)
+
+        aspect = anim_style.resolve_aspect(
+            pred_seq.shape[-2], pred_seq.shape[-1],
+            override=anim_cfg.get("data_aspect"),
+        )
+        print(f"[layout] {field}: data aspect H/W = {aspect:.4f}")
 
         # Shared colorscale across GT and Pred
         vmin_global, vmax_global = compute_vrange(
@@ -272,26 +360,66 @@ def main():
             anim_dir, f"{model_name}_{field}_traj{args.traj_idx}_frame{args.frame_idx}_Pred.gif"
         )
 
-        save_single_gif(
-            gt_seq,
-            T_total,
-            f"GT: {field}",
-            vmin_global,
-            vmax_global,
-            gt_filename,
-            dpi=anim_dpi,
-            fps=anim_fps,
-        )
-        save_single_gif(
-            pred_seq,
-            T_total,
-            f"Pred: {field}",
-            vmin_global,
-            vmax_global,
-            pred_filename,
-            dpi=anim_dpi,
-            fps=anim_fps,
-        )
+        if not args.png_only:
+            gt_gif_prefix = f"{args.gt_display_name}: {field}" if args.gt_display_name else field
+            pred_gif_prefix = f"{args.display_name}: {field}" if args.display_name else field
+            save_single_gif(
+                gt_seq,
+                T_total,
+                gt_gif_prefix,
+                vmin_global,
+                vmax_global,
+                gt_filename,
+                aspect=aspect,
+                dpi=anim_dpi,
+                fps=anim_fps,
+                show_axes=show_axes,
+            )
+            save_single_gif(
+                pred_seq,
+                T_total,
+                pred_gif_prefix,
+                vmin_global,
+                vmax_global,
+                pred_filename,
+                aspect=aspect,
+                dpi=anim_dpi,
+                fps=anim_fps,
+                show_axes=show_axes,
+            )
+
+        for idx1 in save_at_indices:
+            frame = idx1 - 1
+            if frame >= T_total:
+                continue
+            gt_png = os.path.join(
+                anim_dir,
+                f"GT_{field}_traj{args.traj_idx}_frame{args.frame_idx}_saveat{idx1}.png",
+            )
+            pred_png = os.path.join(
+                anim_dir,
+                f"{model_name}_{field}_traj{args.traj_idx}_frame{args.frame_idx}_Pred_saveat{idx1}.png",
+            )
+            save_single_frame_png(
+                gt_seq[frame],
+                args.gt_display_name,
+                vmin_global,
+                vmax_global,
+                gt_png,
+                aspect=aspect,
+                dpi=anim_dpi,
+                show_axes=show_axes,
+            )
+            save_single_frame_png(
+                pred_seq[frame],
+                args.display_name,
+                vmin_global,
+                vmax_global,
+                pred_png,
+                aspect=aspect,
+                dpi=anim_dpi,
+                show_axes=show_axes,
+            )
 
     anim_end_time = time.time()
     print(f"Animation Rendering Completed in {anim_end_time - anim_start_time:.2f} seconds.")

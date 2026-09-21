@@ -25,7 +25,7 @@ from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
 from wamrvit.quad.yt_utils import make_regular_centers
 from wamrvit.native_train_utils import (
     unpack_native_batch, multi_scale_loss, residual_targets,
-    UniformGeometry, full_field_loss,
+    UniformGeometry, full_field_loss, advance_window,
 )
 
 
@@ -64,8 +64,13 @@ def train_func(config_dict: Dict):
         model_cls = QuadTreeTransformer
     model = model_cls(**model_config)
 
-    # Prepare model for DDP. Swin: disable DDP buffer sync.
-    model = prepare_model(model, parallel_strategy_kwargs={"broadcast_buffers": False} if model_class_name == "SwinV2Transformer" else {})
+    # Native batches can leave per-level branches unused on individual ranks.
+    parallel_strategy_kwargs = (
+        {"broadcast_buffers": False} if model_class_name == "SwinV2Transformer" else {}
+    )
+    if model_config.get("multi_scale_patch"):
+        parallel_strategy_kwargs["find_unused_parameters"] = True
+    model = prepare_model(model, parallel_strategy_kwargs=parallel_strategy_kwargs)
 
     if rank == 0:
         print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
@@ -211,8 +216,6 @@ def train_func(config_dict: Dict):
         file_loader_params = config_dict.get("file_loader", {}).get("params", {})
         assert file_loader_params.get("value_storage", "uniform") == "native", \
                "multi_scale_patch requires file_loader.value_storage='native'."
-        if num_push_forward_steps != 1:
-            raise NotImplementedError("num_push_forward_steps>1 is not yet supported in native mode.")
     num_levels_native = int(model_config.get("max_level_idx", 2)) + 1 if multi_scale else 0
 
     # Native-mode loss mode. 
@@ -291,25 +294,42 @@ def train_func(config_dict: Dict):
                 )
                 mask_1d = None  # per-bucket masking not yet wired for multi-scale
                 with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(amp_dtype is not None and mixed_precision != "no")):
-                    if train_config["pred_mode"] == "residual":
-                        targets_learning = residual_targets(targets_by_level, inputs_by_level)
-                    else:
-                        targets_learning = targets_by_level
-                    if train_config["num_gpus"] > 1:
-                        pred_by_level = model.module.forward_multi_scale(
-                            inputs_by_level, leaf_to_bucket, centers,
+                    curr_inputs = inputs_by_level
+                    input_seq_len = next(iter(inputs_by_level.values())).shape[2]
+                    T_out = next(iter(targets_by_level.values())).shape[2]
+                    assert T_out % num_push_forward_steps == 0, (
+                        f"native target T_out ({T_out}) not divisible by "
+                        f"num_push_forward_steps ({num_push_forward_steps})"
+                    )
+                    return_seq_len = T_out // num_push_forward_steps
+
+                    step_total_loss = 0.0
+
+                    for push_forward_step_idx in range(num_push_forward_steps):
+                        target_start_idx = push_forward_step_idx * return_seq_len
+                        target_end_idx = (push_forward_step_idx + 1) * return_seq_len
+                        curr_target = {lvl: t[:, :, target_start_idx:target_end_idx] for lvl, t in targets_by_level.items()}
+                        if train_config["pred_mode"] == "residual":
+                            targets_learning = residual_targets(curr_target, curr_inputs)
+                        else:
+                            targets_learning = curr_target
+                        pred_by_level = model(
+                            curr_inputs, centers, leaf_to_bucket=leaf_to_bucket,
                         )
-                    else:
-                        pred_by_level = model.forward_multi_scale(
-                            inputs_by_level, leaf_to_bucket, centers,
-                        )
-                    if loss_mode == "full_field":
-                        loss = full_field_loss(
-                            loss_fn, pred_by_level, targets_learning,
-                            leaf_to_bucket, centers, _ensure_geom(batch),
-                        )
-                    else:
-                        loss = multi_scale_loss(loss_fn, pred_by_level, targets_learning)
+                        if loss_mode == "full_field":
+                            step_loss = full_field_loss(
+                                loss_fn, pred_by_level, targets_learning,
+                                leaf_to_bucket, centers, _ensure_geom(batch),
+                            )
+                        else:
+                            step_loss = multi_scale_loss(loss_fn, pred_by_level, targets_learning)
+                        step_total_loss += step_loss
+                        if push_forward_step_idx < num_push_forward_steps - 1:
+                            curr_inputs = advance_window(
+                                curr_inputs, pred_by_level, input_seq_len,
+                                return_seq_len, train_config["pred_mode"],
+                            )
+                    loss = step_total_loss / num_push_forward_steps
                 loss = loss / grad_accum_steps
                 loss.backward()
                 if (batch_idx + 1) % grad_accum_steps == 0:
@@ -365,19 +385,10 @@ def train_func(config_dict: Dict):
                     step_total_loss += step_loss
 
                     if push_forward_step_idx < num_push_forward_steps - 1:
-                        if train_config["pred_mode"] == "residual":
-                            next_pred = pred.detach() + curr_input_seq[:, :, -1].unsqueeze(2)
-                        else:
-                            next_pred = pred.detach()
-
-                        num_from_input = max(input_seq_len - return_seq_len, 0)
-                        if num_from_input > 0:
-                            curr_input_seq = torch.cat((
-                                curr_input_seq[:, :, -num_from_input:],
-                                next_pred
-                            ), dim=2)
-                        else:
-                            curr_input_seq = next_pred[:, :, -input_seq_len:]
+                        curr_input_seq = advance_window(
+                            curr_input_seq, pred, input_seq_len,
+                            return_seq_len, train_config["pred_mode"],
+                        )
 
                 loss = step_total_loss / num_push_forward_steps
 

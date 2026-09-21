@@ -101,8 +101,14 @@ def read_plotfile_level(
     level: int,
     header_info: dict[str, Any],
     field_indices: list[int] | None = None,
+    patch_size: tuple[int, int] = (32, 32),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read all grid data for a single AMR level directly from binary files.
+
+    AMReX boxes at a given level can have non-uniform sizes (load-balancing /
+    box merging). Each box is read at its actual on-disk dimensions, then split
+    into patch_size-aligned subgrids so the downstream sampler sees uniformly
+    sized tiles. Box dimensions must be integer multiples of patch_size.
 
     Args:
         plotfile_path: Path to plotfile directory.
@@ -110,13 +116,15 @@ def read_plotfile_level(
         header_info: Dict from read_plotfile_header().
         field_indices: If given, only extract these field indices (0-based).
                        If None, extract all fields.
+        patch_size: (patch_h, patch_w) of output tiles.
 
     Returns:
-        grid_info: (N, 5) float64 — [level, xmin_idx, xmax_idx, ymin_idx, ymax_idx] per grid.
-        grid_data: (N, C, patch_h, patch_w) float32 — field data per grid.
+        grid_info: (N, 5) float64 — [level, xmin_phys, xmax_phys, ymin_phys, ymax_phys].
+        grid_data: (N, C, patch_h, patch_w) float32 — field data per subgrid.
     """
     level_dir = os.path.join(plotfile_path, f"Level_{level}")
     cell_h_path = os.path.join(level_dir, "Cell_H")
+    patch_h, patch_w = patch_size
 
     ncomp_total = header_info["ncomp"]
     C = len(field_indices) if field_indices is not None else ncomp_total
@@ -164,12 +172,26 @@ def read_plotfile_level(
         idx += 1
 
     if n_boxes == 0:
-        return np.zeros((0, 5), dtype=np.float64), np.zeros((0, C, 1, 1), dtype=np.float32)
+        return np.zeros((0, 5), dtype=np.float64), np.zeros((0, C, patch_h, patch_w), dtype=np.float32)
 
-    # Compute grid sizes from boxes (all grids at same level have same size)
-    lo0, hi0 = boxes[0]
-    grid_nx = int(hi0[0] - lo0[0] + 1)
-    grid_ny = int(hi0[1] - lo0[1] + 1)
+    # Per-box dimensions and patch subdivision counts. AMReX allows non-uniform
+    # boxes within a level, so we must NOT inherit boxes[0]'s dims for all FABs.
+    box_dims = []
+    sub_offset = np.zeros(n_boxes, dtype=np.int64)
+    total_subgrids = 0
+    for i, (lo, hi) in enumerate(boxes):
+        nx = int(hi[0] - lo[0] + 1)
+        ny = int(hi[1] - lo[1] + 1)
+        if nx % patch_w != 0 or ny % patch_h != 0:
+            raise ValueError(
+                f"AMReX box {nx}x{ny} at level {level} (box {i}) is not divisible by "
+                f"patch_size {patch_w}x{patch_h}"
+            )
+        nsub_x = nx // patch_w
+        nsub_y = ny // patch_h
+        box_dims.append((nx, ny, nsub_x, nsub_y))
+        sub_offset[i] = total_subgrids
+        total_subgrids += nsub_x * nsub_y
 
     # Read binary data — group by Cell_D file for efficiency
     from collections import defaultdict
@@ -178,7 +200,7 @@ def read_plotfile_level(
     for i, (fab_file, fab_offset) in enumerate(fab_entries):
         file_groups[fab_file].append((i, fab_offset))
 
-    grid_data = np.zeros((n_boxes, C, grid_ny, grid_nx), dtype=np.float32)
+    grid_data = np.zeros((total_subgrids, C, patch_h, patch_w), dtype=np.float32)
 
     for fab_file, entries in file_groups.items():
         fab_path = os.path.join(level_dir, fab_file)
@@ -186,10 +208,13 @@ def read_plotfile_level(
             raw = f.read()
 
         for grid_idx, offset in entries:
+            grid_nx, grid_ny, nsub_x, nsub_y = box_dims[grid_idx]
             # Skip ASCII FAB header line (ends with \n)
             header_end = raw.index(b"\n", offset) + 1
             data_start = header_end
 
+            # Read this FAB's full (C, grid_ny, grid_nx) buffer at native dims.
+            fab_buf = np.empty((C, grid_ny, grid_nx), dtype=np.float32)
             if field_indices is not None:
                 # Selective field extraction
                 for out_c, field_c in enumerate(field_indices):
@@ -199,9 +224,7 @@ def read_plotfile_level(
                     )
                     # AMReX FAB layout: x varies fastest. Reshape (ny, nx) C-order
                     # matches yt's grid[f].d[:,:,0].T
-                    grid_data[grid_idx, out_c, :, :] = arr.reshape(grid_ny, grid_nx).astype(
-                        np.float32
-                    )
+                    fab_buf[out_c] = arr.reshape(grid_ny, grid_nx).astype(np.float32)
             else:
                 arr = np.frombuffer(
                     raw, dtype=np.float64, count=ncomp_total * grid_nx * grid_ny, offset=data_start
@@ -209,22 +232,39 @@ def read_plotfile_level(
                 # Reshape each component: (ny, nx) C-order matches yt convention
                 for c in range(ncomp_total):
                     c_data = arr[c * grid_nx * grid_ny : (c + 1) * grid_nx * grid_ny]
-                    grid_data[grid_idx, c, :, :] = c_data.reshape(
-                        grid_ny, grid_nx, order="F"
+                    fab_buf[c] = c_data.reshape(
+                        grid_ny, grid_nx
                     ).astype(np.float32)
 
-    # Build grid_info with index-space coordinates
+            # Tile the FAB into patch-sized subgrids (row-major by subgrid index).
+            base_out = int(sub_offset[grid_idx])
+            for sy in range(nsub_y):
+                y0 = sy * patch_h
+                for sx in range(nsub_x):
+                    x0 = sx * patch_w
+                    out_idx = base_out + sy * nsub_x + sx
+                    grid_data[out_idx] = fab_buf[:, y0:y0 + patch_h, x0:x0 + patch_w]
+
+    # Build grid_info with physical-space coordinates for each subgrid
     dx = header_info["dx"][level]
     domain_lo = header_info["domain_lo"]
 
-    grid_info = np.zeros((n_boxes, 5), dtype=np.float64)
+    grid_info = np.zeros((total_subgrids, 5), dtype=np.float64)
     for i, (lo, hi) in enumerate(boxes):
-        grid_info[i, 0] = float(level)
-        # Physical coordinates of grid edges
-        grid_info[i, 1] = domain_lo[0] + lo[0] * dx[0]  # xmin physical
-        grid_info[i, 2] = domain_lo[0] + (hi[0] + 1) * dx[0]  # xmax physical
-        grid_info[i, 3] = domain_lo[1] + lo[1] * dx[1]  # ymin physical
-        grid_info[i, 4] = domain_lo[1] + (hi[1] + 1) * dx[1]  # ymax physical
+        _, _, nsub_x, nsub_y = box_dims[i]
+        base_out = int(sub_offset[i])
+        for sy in range(nsub_y):
+            sub_lo_y = lo[1] + sy * patch_h
+            sub_hi_y = sub_lo_y + patch_h  # exclusive boundary
+            for sx in range(nsub_x):
+                sub_lo_x = lo[0] + sx * patch_w
+                sub_hi_x = sub_lo_x + patch_w  # exclusive boundary
+                out_idx = base_out + sy * nsub_x + sx
+                grid_info[out_idx, 0] = float(level)
+                grid_info[out_idx, 1] = domain_lo[0] + sub_lo_x * dx[0]
+                grid_info[out_idx, 2] = domain_lo[0] + sub_hi_x * dx[0]
+                grid_info[out_idx, 3] = domain_lo[1] + sub_lo_y * dx[1]
+                grid_info[out_idx, 4] = domain_lo[1] + sub_hi_y * dx[1]
 
     return grid_info, grid_data
 
@@ -263,7 +303,7 @@ def read_plotfile_raw(
     all_grid_data = []
 
     for level in range(header_info["max_level_idx"] + 1):
-        gi, gd = read_plotfile_level(plotfile_path, level, header_info, field_indices)
+        gi, gd = read_plotfile_level(plotfile_path, level, header_info, field_indices, patch_size)
         if gi.shape[0] > 0:
             all_grid_info.append(gi)
             all_grid_data.append(gd)
@@ -346,9 +386,8 @@ def _fast_sample_leaves(
                     g_ymin = grid_info[best_g, 3]
                     g_ymax = grid_info[best_g, 4]
 
-                    # Assuming all yt grids are 32x32
-                    dx_grid = (g_xmax - g_xmin) / 32.0
-                    dy_grid = (g_ymax - g_ymin) / 32.0
+                    dx_grid = (g_xmax - g_xmin) / patch_size[1]
+                    dy_grid = (g_ymax - g_ymin) / patch_size[0]
 
                     gx = int((px - g_xmin) / dx_grid)
                     gy = int((py - g_ymin) / dy_grid)
@@ -356,12 +395,12 @@ def _fast_sample_leaves(
                     # Clamp indices safely
                     if gx < 0:
                         gx = 0
-                    elif gx > 31:
-                        gx = 31
+                    elif gx > patch_size[1] - 1:
+                        gx = patch_size[1] - 1
                     if gy < 0:
                         gy = 0
-                    elif gy > 31:
-                        gy = 31
+                    elif gy > patch_size[0] - 1:
+                        gy = patch_size[0] - 1
 
                     for c in range(C):
                         out_values[i, c, iy, ix] = grid_data[best_g, c, gy, gx]

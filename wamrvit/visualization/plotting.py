@@ -265,6 +265,7 @@ def plot_quadtree(
     draw_outlines: bool = True,  # Added toggle to prevent Matplotlib choke
     x_frac: tuple[float, float] | None = None,
     y_frac: tuple[float, float] | None = None,
+    cax=None,
 ):
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 8))  # slightly larger default for detail
@@ -447,9 +448,12 @@ def plot_quadtree(
     )
 
     if colorbar and im:
-        divider = make_axes_locatable(ax)
-        cax = divider.append_axes("right", size="4%", pad=0.05)
-        fig.colorbar(im, cax=cax)
+        if cax is not None:
+            fig.colorbar(im, cax=cax)
+        else:
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="4%", pad=0.05)
+            fig.colorbar(im, cax=cax)
 
     ax.set_aspect("equal", adjustable="box")
     if use_crop:
