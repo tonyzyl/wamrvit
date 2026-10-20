@@ -1,0 +1,16 @@
+# @package _global_
+# TRL visualization uses the explicit test split and one-step/no-regrid protocol.
+defaults:
+  - rollout_trl
+  - _self_
+
+animation:
+  output_dir: ${output_root}/animations
+  field_names: ${fields.all}
+  dpi: 200
+  fps: 4
+  show_axes: true
+  data_aspect: null
+  outline_width: 0.3
+  draw_outlines: True
+  gt_grid_mode: overlay

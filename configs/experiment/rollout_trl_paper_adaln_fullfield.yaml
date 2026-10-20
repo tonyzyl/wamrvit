@@ -1,0 +1,19 @@
+# @package _global_
+# Existing TRL native Conv3D/AdaLN/full-field one-step test protocol.
+defaults:
+  - rollout_trl_paper_uniform_adaptive
+  - _self_
+
+model:
+  concat_mlp: True
+  multi_scale_patch: True
+  multi_scale_channel_mult: 2
+  level_conditioned_norm: True
+
+file_loader:
+  params:
+    value_storage: native
+
+inference:
+  checkpoint_path: ${checkpoint_root}/trl_native_fullfield/model
+  output_csv: ${output_root}/rmse_trl_native_fullfield.csv

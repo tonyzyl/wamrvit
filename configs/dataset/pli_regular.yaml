@@ -1,0 +1,33 @@
+# @package _global_
+# PLI regular ViT/Conv3D, finest patch [10, 5].
+
+defaults:
+  - _pli_common
+
+model:
+  _class_name: QuadTreeTransformer
+  in_channels: 10
+  patch_size: [10, 5]                # finest patch — matches pli_regular_train.yaml
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  num_layers: 6
+  attention_head_dim: 192
+  num_attention_heads: 12
+  mlp_ratio: 1.0
+  rope_theta: 10000
+  rope_axes_dim: ${rope_axes_dim_regular:${model.attention_head_dim}}
+  rope_scale: [80, 224]              # [W/min_patch, H/min_patch] = [400/5, 1120/5]
+  eps: 1e-7
+  adaptive: False
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.NpzRegularLoader
+  params:
+    field_names: ${fields.all}
+    coarsen_factor: 1
+    coarsen_mode: mean
+
+transform:
+  target: wamrvit.dataloader.payload.transforms.PLIRegularTransform
+  params:
+    field_names: ${fields.all}

@@ -1,0 +1,26 @@
+# @package _global_
+# AMReX animation uses the same uniform GPU replay path as metric rollouts.
+defaults:
+  - rollout_amrex
+  - _self_
+
+inference:
+  predict_steps: 8
+  regrid_backend: array
+  array_regrid_value_storage: source
+  array_regrid_payload_backend: gpu_replay
+  array_regrid_capacity: 8192
+  # The existing object fallback remains available for unsupported/capacity cases.
+
+animation:
+  output_dir: ${output_root}/animations
+  field_names: [T, pressure, HRR, rho, rhoY_H2, rhoY_O2, rhoY_OH]
+  dpi: 300
+  fps: 4
+  show_axes: true
+  data_aspect: null
+  outline_width: 0.3
+  draw_outlines: True
+  max_pixels: 8192
+  gt_grid_mode: adaptive
+  gt_adaptive_remap: uniform

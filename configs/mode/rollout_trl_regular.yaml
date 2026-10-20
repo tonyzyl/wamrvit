@@ -1,0 +1,12 @@
+# @package _global_
+# TRL one-step evaluation on explicit test sources; no inference regrid.
+data:
+  glob_pattern: ${test_data_paths.trl}
+
+inference:
+  predict_steps: 1
+  pred_mode: target
+  metrics: [RMSE, VRMSE]
+  checkpoint_path: null
+  output_csv: null
+  split_policy: prepartitioned

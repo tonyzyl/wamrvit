@@ -1,0 +1,21 @@
+# @package _global_
+# Portable eight-GPU resource template; paths are inherited from env/local.
+defaults:
+  - local
+  - _self_
+
+train:
+  num_gpus: 8
+  actor_pool_size: 8
+  ray_stream_map_concurrency: 8
+  ray_stream_object_store_memory_gib: 64
+  ray_stream_node_headroom_gib: 32
+  resident_node_headroom_gib: 32
+
+inference:
+  num_cpus: 12
+  num_gpus: 1
+  ray_object_store_memory: 64
+
+general:
+  ray_object_store_memory: 64

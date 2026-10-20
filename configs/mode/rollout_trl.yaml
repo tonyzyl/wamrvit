@@ -1,0 +1,16 @@
+# @package _global_
+# TRL adaptive one-step evaluation; tolerance applies to initial topology only.
+defaults:
+  - rollout_trl_regular
+  - _self_
+
+file_loader:
+  params:
+    adapt_on_channels: [0, 1, 2, 3]
+
+inference:
+  regrid_interval: 9999  # no regrid within the one-step protocol
+  regrid_tol_frac: [0.1, 0.1, 0.1, 0.1]
+  regrid_adapt_nearby: 2
+  regrid_backend: array
+  array_regrid_payload_backend: cpu_eager

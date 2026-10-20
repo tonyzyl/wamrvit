@@ -1,0 +1,32 @@
+# @package _global_
+# Canonical AMReX ViT/Conv3D: p32 on simulation level 2 (1024 x 6144).
+# Token grid is 32 x 192 (6144 tokens).
+
+defaults:
+  - _amrex_common
+
+model:
+  _class_name: QuadTreeTransformer
+  in_channels: 17
+  patch_size: [32, 32]
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  num_layers: 6
+  attention_head_dim: 192
+  num_attention_heads: 12
+  mlp_ratio: 1.0
+  rope_theta: 10000
+  rope_axes_dim: ${rope_axes_dim_regular:${model.attention_head_dim}}
+  rope_scale: [192, 32]   # (W/p_w, H/p_h) = (6144/32, 1024/32)
+  eps: 1e-7
+  adaptive: False
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.YTAmReXRegularLoader
+  params:
+    field_names: ${fields.all}
+    domain_from: domain
+    target_level: 2
+
+data:
+  domain_from: domain

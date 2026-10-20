@@ -1,0 +1,4 @@
+# @package _global_
+# Canonical raw PLI uniform-adaptive/regular-finest comparison.
+defaults:
+  - rollout_combined_pli_uniform

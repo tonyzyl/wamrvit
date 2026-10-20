@@ -1,0 +1,13 @@
+# @package _global_
+# Canonical AMReX regular ViT: p32, simulation level 2, fixed PF4.
+defaults:
+  - override /dataset: amrex_regular
+  - override /mode: train
+
+train:
+  num_train_epochs: 600
+  save_every_epochs: 1000
+  num_push_forward_steps: 4
+
+general:
+  run_name: amrex_regular_p32

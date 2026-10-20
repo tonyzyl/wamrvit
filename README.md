@@ -86,27 +86,52 @@ Density field, TRL (turbulent radiative layer) trajectory 0, frame 20. 128 × 38
 
 ## Install
 
+Python ≥ 3.12. Run from this source checkout; training uses CUDA and Ray Train/DDP.
+
 ```bash
 uv sync
-uv pip install -e .
 ```
 
-Python ≥ 3.12.
+## Training
 
-## Status
+Choose a recipe from `configs/experiment/` and set your paths:
 
-Code-only release: configuration files, normalization data, and example
-commands are not included in this revision.
+```bash
+export DATA_ROOT=/path/to/data
+export CHECKPOINT_ROOT=/path/to/checkpoints
+export OUTPUT_ROOT=/path/to/outputs
+
+uv run train.py +experiment=pli_adaptive_train general.run_name=pli_adaptive
+```
+
+Path templates are in `configs/env/local.yaml`; override paths/resources with Hydra. `env=local` targets one GPU; `env=hpc` targets eight. Training preserves held-out partitions but does not run a validation-loss loop. `--topo-cache` is used for reporting the results in paper.
+
+## Inference
+
+```bash
+uv run wamrvit/rollout/rollout_adaptive.py +experiment=rollout_pli_adaptive inference.checkpoint_path=/path/to/model
+```
+
+Combined recipes use `inference.checkpoint_path_adaptive` and `inference.checkpoint_path_regular`. Keep source ground truth (GT) enabled (`file_loader.params.return_src=true`) for correct regridded evaluation. Preserve the configured held-out cohort; `--eval_full` changes the evaluation protocol.
 
 ## Layout
 
+`train.py`: training · `configs/`: recipes · `wamrvit/`: models, data pipelines, regridding, rollout, and visualization.
+
+## Citation
+
+```bibtex
+@misc{zhuang2026dynamicquadtreetokenizationtransformer,
+  title={Dynamic Quadtree Tokenization and Transformer for Adaptive Mesh PDE Forecasting},
+  author={Yilin Zhuang and Noah Zambrano and Karthik Duraisamy},
+  year={2026},
+  eprint={2610.04044},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2610.04044},
+}
 ```
-train.py                    Training entry point (Ray Tune + DDP)
-wamrvit/
-├── quadtree_transformer.py Adaptive quadtree ViT
-├── swin_transformer.py     Regular-grid SwinV2 baseline
-├── quad/                   Quadtree primitives and adaptation
-├── dataloader/             Data loading, topology caching
-├── rollout/                Autoregressive rollout, metrics
-└── visualization/          Plotting utilities
-```
+
+## License
+
+WAMRViT-original code is MIT-licensed; see `LICENSE`. NeuralOperator loss attribution is retained in `wamrvit/loss.py` under the same MIT terms. The Well-derived metrics retain their BSD-3-Clause notice in the header of `wamrvit/rollout/regular_metrics.py`.

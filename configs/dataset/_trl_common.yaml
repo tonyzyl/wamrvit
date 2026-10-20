@@ -1,0 +1,44 @@
+# @package _global_
+# Shared TRL fields, normalization and explicit train/validation sources.
+
+fields:
+  all:
+    - density
+    - pressure
+    - velocity_x
+    - velocity_y
+
+file_parser:
+  target: wamrvit.dataloader.selection.sources.hdf5_multi_traj_parser
+  params:
+    field_group: t0_fields
+    shape_field: density
+
+window_generator:
+  target: wamrvit.dataloader.selection.windows.generate_multi_trajectory_windows
+  params:
+    # The well: n_steps_input=4, n_steps_output=1
+    input_seq_len: 4
+    return_seq_len: 1
+    sampling_interval: 1
+    interval_between_pred: 1
+
+transform:
+  target: wamrvit.dataloader.payload.transforms.NormalizeArray
+  params:
+    channel_dim: -4
+    norm_json_path: wamrvit/static/trl_normalization.json
+    field_names: ${fields.all}
+
+# Cache identity only; topology caching remains CLI opt-in.
+topology_store:
+  source_root: ${data_root}/the_well/data
+  dataset_id: trl
+
+data:
+  time:
+    source: index
+    step: 1.0
+  glob_pattern: ${data_paths.trl}
+  val_glob_pattern: ${val_data_paths.trl}
+  field_names: ${fields.all}

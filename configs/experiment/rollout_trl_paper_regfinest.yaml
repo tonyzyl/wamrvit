@@ -1,0 +1,9 @@
+# @package _global_
+# Existing TRL regular-finest ViT one-step test protocol; no adaptive loader knobs.
+defaults:
+  - override /dataset: trl_regular
+  - override /mode: rollout_trl_regular
+
+inference:
+  checkpoint_path: ${checkpoint_root}/trl_regular/model
+  output_csv: ${output_root}/rmse_trl_regular.csv

@@ -3,12 +3,7 @@ from typing import Any, Literal, Optional, Union
 import numpy as np
 import torch
 
-from wamrvit.quad.quadtree import (
-    Quadtree,
-    TreeDiff,
-    apply_tree_diff,
-    compute_tree_diff,
-)
+from wamrvit.quad.quadtree import Quadtree
 
 
 def random_resample_quadtree(
@@ -146,75 +141,6 @@ def quadtree_to_tensor(
     return x, meta
 
 
-# save/load quadtree remain effectively unchanged as they just serialize numpy arrays
-def save_quadtree(qt: Quadtree, path: str) -> None:
-    coarse_qt = Quadtree(
-        qt.xmin,
-        qt.xmax,
-        qt.ymin,
-        qt.ymax,
-        max_level_idx=qt.max_level_idx,
-        channels=qt.channels,
-        tile_width=qt.tile_width,
-        tile_height=qt.tile_height,
-    )
-    diff = compute_tree_diff(coarse_qt, qt, include_values=True)
-    save_dict = {
-        "xmin": diff.xmin,
-        "xmax": diff.xmax,
-        "ymin": diff.ymin,
-        "ymax": diff.ymax,
-        "nx_tiles": diff.nx_tiles,
-        "ny_tiles": diff.ny_tiles,
-        "max_level_idx": diff.max_level_idx,
-        "channels": diff.channels,
-        "ids": diff.ids,
-        "tuples": diff.tuples,
-    }
-    if diff.values is not None:
-        save_dict["values"] = diff.values
-    if diff.ops is not None:
-        save_dict["ops"] = diff.ops
-
-    np.savez(path, **save_dict)
-
-
-def load_quadtree(path: str) -> Quadtree:
-    with np.load(path) as data:
-        diff = TreeDiff(
-            xmin=data["xmin"].item(),
-            xmax=data["xmax"].item(),
-            ymin=data["ymin"].item(),
-            ymax=data["ymax"].item(),
-            nx_tiles=data["nx_tiles"].item(),
-            ny_tiles=data["ny_tiles"].item(),
-            max_level_idx=data["max_level_idx"].item(),
-            channels=data["channels"].item(),
-            ids=data["ids"],
-            tuples=data["tuples"],
-            values=data.get("values"),
-            ops=data.get("ops"),
-        )
-
-    # Infer tile dims
-    tw = (diff.xmax - diff.xmin) / max(1, diff.nx_tiles)
-    th = (diff.ymax - diff.ymin) / max(1, diff.ny_tiles)
-
-    qt = Quadtree(
-        xmin=diff.xmin,
-        xmax=diff.xmax,
-        ymin=diff.ymin,
-        ymax=diff.ymax,
-        max_level_idx=diff.max_level_idx,
-        channels=diff.channels,
-        tile_width=tw,
-        tile_height=th,
-    )
-
-    apply_tree_diff(qt, diff, update_values=True)
-    return qt
-
-
 def tensor_to_quadtree(
     data: Union[np.ndarray, "torch.Tensor"],
     meta: dict[str, Any],
@@ -290,61 +216,25 @@ def tensor_to_quadtree(
     return qt
 
 
-def quadtree_to_uniform(
-    qt: "Quadtree",
-    return_tensor: bool = False,
-    device: Optional["torch.device"] = None,
-    dtype: Optional["torch.dtype"] = None,
-) -> Union[np.ndarray, "torch.Tensor"]:
+def make_regular_centers(H, W, p, device):
     """
-    Converts a Quadtree into a uniform, max-resolution dense grid.
-    Returns an array (or tensor) of shape (C, H, W).
+    Compute regular grid patch centers for ViT, values in [0, 1] relative to the global domain.
     """
-    # Calculate the scale factor from the root tile to the finest minimal cell
-    max_scale = 1 << qt.max_level_idx
+    if isinstance(p, int):
+        p = (p, p)
+    H_p, W_p = H // p[0], W // p[1]
 
-    # Calculate full uniform dimensions at max resolution
-    H = qt.ny_tiles * qt.patch_height * max_scale
-    W = qt.nx_tiles * qt.patch_width * max_scale
-    C = qt.channels
+    ys = (torch.arange(H_p, device=device) + 0.5) * p[0] / H
+    xs = (torch.arange(W_p, device=device) + 0.5) * p[1] / W
 
-    # Initialize the empty dense array
-    out = np.zeros((C, H, W), dtype=np.float32)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    centers = torch.stack([xx, yy], dim=-1)  # (H_p, W_p, 2)
 
-    for leaf in qt._iter_all_leaves():
-        val = leaf.value
-        if val is None:
-            continue
+    # Optional: add scale (patch size)
+    # h = torch.full((H_p, W_p, 1), p[0] / H, device=device)
+    # centers = torch.cat([centers, h], dim=-1)
 
-        # Determine how much this leaf needs to be scaled up to match the max resolution
-        scale = max(0, qt.max_level_idx - leaf.level_idx)
-
-        # Get the logical base coordinates of the leaf in terms of minimal cells
-        x0, y0 = qt._leaf_fine_coords(leaf)
-
-        # Map to actual pixel indices in the dense grid
-        px_start = x0 * qt.patch_width
-        py_start = y0 * qt.patch_height
-
-        px_end = px_start + ((1 << scale) * qt.patch_width)
-        py_end = py_start + ((1 << scale) * qt.patch_height)
-
-        if scale > 0:
-            # SCORING ONLY: nearest-neighbor upsample of coarse cells onto the dense grid
-            # for the uniform-adaptive full-field metric. NOTE: refine() value-fill is now
-            # bilinear (object/array byte-parity), so this no longer mirrors refine -- kept
-            # nearest deliberately for now. It is applied IDENTICALLY to both regrid backends,
-            # so it does not affect the object-vs-array comparison (only absolute metric scale).
-            val_up = np.repeat(np.repeat(val, 1 << scale, axis=1), 1 << scale, axis=2)
-            out[:, py_start:py_end, px_start:px_end] = val_up
-        else:
-            # Already at maximum resolution
-            out[:, py_start:py_end, px_start:px_end] = val
-
-    if return_tensor:
-        return torch.as_tensor(out, device=device, dtype=dtype if dtype else torch.float32)
-
-    return out
+    return centers.view(-1, 2)  # (N, 2)
 
 
 def tensor_to_uniform(

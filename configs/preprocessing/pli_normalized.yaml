@@ -1,0 +1,7 @@
+# @package transform
+# Opt-in only: append +preprocessing=pli_normalized after the experiment override.
+# Fit this artifact on the same training sources; reuse it unchanged for rollout.
+target: wamrvit.dataloader.payload.transforms.PLINormalizedTransform
+params:
+  field_names: ${fields.all}
+  norm_json_path: ???

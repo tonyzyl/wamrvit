@@ -1,0 +1,17 @@
+# @package _global_
+# PLI regular-grid evaluation, fixed cadence and manuscript window cohort.
+train:
+  split_ratio: 0.8
+  num_push_forward_steps: 1
+
+inference:
+  predict_steps: 20
+  pred_mode: target
+  metrics: [RMSE, VRMSE]
+  checkpoint_path: null
+  output_csv: null
+  split_policy: internal
+  preserve_window_cohort: true
+  require_unseen_trajectories: true
+  require_unseen_inputs: true
+  include_eval_tail: false

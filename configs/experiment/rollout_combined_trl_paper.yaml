@@ -1,0 +1,17 @@
+# @package _global_
+# Existing TRL uniform-adaptive/regular-finest one-step comparison on test sources.
+defaults:
+  - override /dataset: trl_adaptive
+  - override /mode: rollout_trl
+
+file_loader:
+  params:
+    return_src: True
+
+inference:
+  checkpoint_path_adaptive: ${checkpoint_root}/trl_uniform_adaptive/model
+  checkpoint_path_regular: ${checkpoint_root}/trl_regular/model
+  compute_uniform_metrics: True
+  num_gpus_adaptive: 1
+  num_gpus_regular: 1
+  output_csv: ${output_root}/rmse_combined_trl.csv

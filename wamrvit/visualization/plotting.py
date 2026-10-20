@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import PatchCollection
 from matplotlib.patches import Rectangle
-from matplotlib.ticker import MultipleLocator
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from wamrvit.quad.quadtree import Quadtree
@@ -61,191 +60,6 @@ def compute_vrange(gt_arrays, pred_arrays, field_label, anim_cfg):
     vmin = auto_vmin if vmin_o is None else float(vmin_o)
     vmax = auto_vmax if vmax_o is None else float(vmax_o)
     return vmin, vmax
-
-
-def visualize_channels(channels_data, channel_names=None, time_slice=None, figsize=(15, 10)):
-    """
-    Visualize all channels at a specific time slice
-
-    Parameters:
-    channels_data (dict): Dictionary with channel data arrays
-    channel_names (list): List of channel names to visualize
-    time_slice (int): Time slice to visualize (default: middle)
-    figsize (tuple): Figure size
-    """
-    if channel_names is None:
-        channel_names = list(channels_data.keys())
-
-    # Determine time slice
-    if time_slice is None:
-        first_channel = list(channels_data.values())[0]
-        time_slice = first_channel.shape[2] // 2
-
-    # Create subplot layout
-    n_channels = len(channel_names)
-    cols = 3
-    rows = (n_channels + cols - 1) // cols
-
-    fig, axes = plt.subplots(rows, cols, figsize=figsize)
-    if rows == 1 and cols == 1:
-        axes = [axes]
-    elif rows == 1:
-        axes = axes
-    else:
-        axes = axes.flatten()
-
-    print(f"Visualizing time slice {time_slice}")
-
-    for i, channel_name in enumerate(channel_names):
-        if channel_name in channels_data:
-            channel_data = channels_data[channel_name][:, :, time_slice]
-
-            im = axes[i].imshow(channel_data, cmap="RdBu_r", aspect="auto", origin="lower")
-            axes[i].set_title(
-                f"{channel_name}\\n"
-                f"(min: {np.min(channel_data):.3f}, max: {np.max(channel_data):.3f})"
-            )
-            axes[i].set_xlabel("Width")
-            axes[i].set_ylabel("Height")
-            plt.colorbar(im, ax=axes[i], shrink=0.8)
-        else:
-            axes[i].text(
-                0.5,
-                0.5,
-                f"Channel {channel_name}\\nnot found",
-                ha="center",
-                va="center",
-                transform=axes[i].transAxes,
-            )
-            axes[i].set_title(f"{channel_name} (missing)")
-
-    # Remove empty subplots
-    for j in range(len(channel_names), len(axes)):
-        fig.delaxes(axes[j])
-
-    plt.tight_layout()
-    plt.show()
-
-
-def visualize_timestep(trajectory_data, t, channel_names=None, figsize=(15, 10)):
-    """
-    Visualize all channels at a specific time step
-
-    Parameters:
-    trajectory_data (numpy.ndarray): 4D trajectory array (height, width, channels, time)
-    t (int): Time step to visualize
-    channel_names (list): List of channel names
-    figsize (tuple): Figure size
-    """
-    if channel_names is None:
-        channel_names = ["rho", "u", "v", "p", "ogm1"]
-
-    n_channels = min(len(channel_names), trajectory_data.shape[2])
-    cols = 3
-    rows = (n_channels + cols - 1) // cols
-
-    fig, axes = plt.subplots(rows, cols, figsize=figsize)
-    if rows == 1:
-        axes = axes.reshape(1, -1)
-    axes = axes.flatten()
-
-    for i in range(n_channels):
-        channel_data = trajectory_data[:, :, i, t]
-        channel_name = channel_names[i] if i < len(channel_names) else f"Channel_{i}"
-
-        im = axes[i].imshow(channel_data, cmap="RdBu_r", aspect="auto", origin="lower")
-        axes[i].set_title(
-            f"{channel_name} at t={t}\\n"
-            f"(min: {np.min(channel_data):.3f}, max: {np.max(channel_data):.3f})"
-        )
-        axes[i].set_xlabel("Width")
-        axes[i].set_ylabel("Height")
-        plt.colorbar(im, ax=axes[i], shrink=0.8)
-
-    # Remove empty subplots
-    for j in range(n_channels, len(axes)):
-        fig.delaxes(axes[j])
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_temporal_evolution(trajectory_data, x, y, channel_names=None, figsize=(12, 8)):
-    """
-    Plot temporal evolution of all channels at a specific (x,y) location
-
-    Parameters:
-    trajectory_data (numpy.ndarray): 4D trajectory array or channels_data dict
-    x, y (int): Spatial coordinates
-    channel_names (list): List of channel names
-    figsize (tuple): Figure size
-    """
-    plt.figure(figsize=figsize)
-
-    if isinstance(trajectory_data, dict):
-        # If it's a channels_data dictionary
-        for channel_name, data in trajectory_data.items():
-            temporal_data = data[y, x, :]
-            plt.plot(temporal_data, label=channel_name, linewidth=2)
-    else:
-        # If it's a 4D trajectory array
-        if channel_names is None:
-            channel_names = ["rho", "u", "v", "p", "ogm1"]
-
-        for i, channel_name in enumerate(channel_names):
-            if i < trajectory_data.shape[2]:
-                temporal_data = trajectory_data[y, x, i, :]
-                plt.plot(temporal_data, label=channel_name, linewidth=2)
-
-    plt.xlabel("Time Step")
-    plt.ylabel("Value")
-    plt.gca().xaxis.set_major_locator(MultipleLocator(2))
-    plt.title(f"Temporal Evolution at Location ({x}, {y})")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
-
-
-def compare_spatial_evolution(channels_data, channel_name, points=None, figsize=(12, 8)):
-    """
-    Compare temporal evolution at different spatial locations for a single channel
-
-    Parameters:
-    channels_data (dict): Dictionary with channel data
-    channel_name (str): Name of channel to analyze
-    points (list): List of (x, y, label) tuples for comparison points
-    figsize (tuple): Figure size
-    """
-    if channel_name not in channels_data:
-        print(f"Channel '{channel_name}' not found!")
-        return
-
-    data = channels_data[channel_name]
-
-    if points is None:
-        # Default comparison points
-        center_x, center_y = data.shape[1] // 2, data.shape[0] // 2
-        points = [
-            (center_x, center_y, "Center"),
-            (data.shape[1] // 4, data.shape[0] // 4, "Bottom-left"),
-            (3 * data.shape[1] // 4, 3 * data.shape[0] // 4, "Top-right"),
-            (center_x, data.shape[0] // 4, "Bottom-center"),
-            (center_x, 3 * data.shape[0] // 4, "Top-center"),
-        ]
-
-    plt.figure(figsize=figsize)
-
-    for x, y, label in points:
-        temporal_data = data[y, x, :]
-        plt.plot(temporal_data, label=f"{label} ({x},{y})", linewidth=2)
-
-    plt.title(f"{channel_name} - Spatial Comparison")
-    plt.xlabel("Time Step")
-    plt.ylabel("Value")
-    plt.gca().xaxis.set_major_locator(MultipleLocator(2))
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.show()
 
 
 def plot_quadtree(
@@ -487,9 +301,9 @@ def plot_quadtree_boundary(
     """Plot only boundary leaves; non-boundary leaves are masked to NaN."""
     raise RuntimeError(
         "plot_quadtree_boundary requires QuadCell.is_boundary to be set. "
-        "mark_boundary_cells() calls were disabled because the flag is unread "
-        "by the active training/inference pipeline. To use this function, "
-        "call qt.mark_boundary_cells() explicitly first."
+        "mark_boundary_cells() calls were disabled in commit 8cf61fd because the "
+        "flag is unread by the active training/inference pipeline. To use this "
+        "function, call qt.mark_boundary_cells() explicitly first."
     )
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 8))
@@ -697,7 +511,7 @@ def plot_npz_content(file_path, exclude_keys=None, cols_per_row=4, figsize_scale
 
 
 ## --- Usage Example ---
-# file_path = '/mnt/hdd1/oceans11_cyl/cx241203_fp16_full/cx241203_id01101_pvi_idx00022.npz'
+# file_path = '/path/to/trajectory_frame.npz'
 ## Define keys you don't care about (e.g., coordinate grids or metadata)
 # ignore_list = ["sim_time", "Rcoord", "Zcoord"]
 # plot_npz_content(file_path, exclude_keys=ignore_list, cols_per_row=4)

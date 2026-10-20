@@ -1,0 +1,9 @@
+# @package _global_
+# Raw PLI regular-finest ViT evaluation; checkpoint geometry is unchanged.
+defaults:
+  - override /dataset: pli_regular
+  - override /mode: rollout_pli_regular
+
+inference:
+  checkpoint_path: ${checkpoint_root}/pli_regular/model
+  output_csv: ${output_root}/rmse_pli_regular.csv

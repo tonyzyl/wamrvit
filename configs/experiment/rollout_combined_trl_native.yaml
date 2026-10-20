@@ -1,0 +1,19 @@
+# @package _global_
+# Existing native TRL full-field checkpoint versus regular-finest, one step/no regrid.
+defaults:
+  - rollout_combined_trl_paper
+  - _self_
+
+model:
+  concat_mlp: True
+  multi_scale_patch: True
+  multi_scale_channel_mult: 2
+  level_conditioned_norm: True
+
+file_loader:
+  params:
+    value_storage: native
+
+inference:
+  checkpoint_path_adaptive: ${checkpoint_root}/trl_native_fullfield/model
+  output_csv: ${output_root}/rmse_combined_trl_native.csv

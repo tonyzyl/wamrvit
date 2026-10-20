@@ -1,0 +1,11 @@
+# Compose with train.py or a rollout/animation entry point.
+# Example: +experiment=pli_adaptive_train env=local
+# Paths use DATA_ROOT, CHECKPOINT_ROOT and OUTPUT_ROOT; CLI overrides also work.
+defaults:
+  - dataset: pli_adaptive
+  - mode: train
+  - env: local
+  - _self_
+
+general:
+  run_name: ???  # required unless supplied by an experiment

@@ -1,0 +1,8 @@
+# @package _global_
+# TRL uniform-adaptive one-step visualization on explicit test sources; no regrid.
+defaults:
+  - override /dataset: trl_adaptive
+  - override /mode: animate_trl
+
+inference:
+  checkpoint_path: ${checkpoint_root}/trl_uniform_adaptive/model

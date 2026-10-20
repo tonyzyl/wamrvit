@@ -1,0 +1,16 @@
+# @package _global_
+# PLI animation inherits fixed cadence and CPU eager array regridding.
+defaults:
+  - rollout_pli
+  - _self_
+
+animation:
+  output_dir: ${output_root}/animations
+  field_names: ${fields.eval}
+  dpi: 200
+  fps: 4
+  show_axes: true
+  data_aspect: null
+  outline_width: 0.3
+  draw_outlines: True
+  gt_grid_mode: overlay

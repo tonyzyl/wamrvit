@@ -1,0 +1,32 @@
+# @package _global_
+# TRL regular ViT/Conv3D, finest patch [4, 4].
+
+defaults:
+  - _trl_common
+
+model:
+  _class_name: QuadTreeTransformer
+  in_channels: 4
+  patch_size: [4, 4]                # finest patch — matches trl_regular_train.yaml
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  num_layers: 6
+  attention_head_dim: 192
+  num_attention_heads: 12
+  mlp_ratio: 1.0
+  rope_theta: 10000
+  rope_axes_dim: ${rope_axes_dim_regular:${model.attention_head_dim}}
+  rope_scale: [96, 32]               # [W/min_patch, H/min_patch] = [384/4, 128/4]
+  eps: 1e-7
+  adaptive: False
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.HDF5RegularLoader
+  params:
+    scalar_fields:
+      density: [t0_fields, density]
+      pressure: [t0_fields, pressure]
+    vector_fields:
+      velocity_x: [t1_fields, velocity, 0]
+      velocity_y: [t1_fields, velocity, 1]
+    field_order: ${fields.all}

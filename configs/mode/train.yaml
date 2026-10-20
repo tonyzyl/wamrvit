@@ -1,0 +1,53 @@
+# @package _global_
+# Fixed-cadence push-forward training; clocks/source selection live in dataset/.
+optimizer:
+  name: adamw
+  betas: [0.9, 0.999]
+  eps: 1e-08
+  lr: 1e-4
+  weight_decay: 1e-2
+
+lr_scheduler:
+  name: cosine
+  num_warmup_steps: 1000
+  num_cycles: 0.5
+  power: 1.0
+  min_lr: 1e-6
+
+loss_fn:
+  target: wamrvit.loss.LpLoss
+  params:
+    d: 3
+    p: 2
+    reduce_dims: [0, 1]
+    reductions: mean
+    method: abs
+    eps: 1e-4
+
+# Topology caching is opt-in: --cache_topology --topology_cache_dir=... .
+# Dataset groups supply portable source-root identities for cache relocation.
+train:
+  mixed_precision: bf16
+  seed: 42
+  batch_size: 1
+  num_train_epochs: 10
+  split_ratio: 0.8  # fixed-window reference prefix; explicit val/test sources override
+  save_every_epochs: 50
+  grad_accum_steps: 1
+  num_push_forward_steps: 1
+  pred_mode: target
+  payload_transport: ray_stream  # bounded expanded-payload streaming, not eager materialization
+  map_batch_size: 1
+  prefetch: 0
+  ray_stream_prefetch_batches: 0
+  streaming_overlap_staging: false
+  resident_object_store_usable_fraction: 0.85
+
+ema:
+  use_ema: True
+  offload_ema: False
+  ema_max_decay: 0.9999
+  ema_inv_gamma: 1.0
+  ema_power: 0.6666667
+  ema_update_after_step: 1000
+  foreach: True

@@ -1,0 +1,9 @@
+# @package _global_
+# Existing mid-grid TRL ViT recipe: patch [4, 8], unchanged finest-pixel RoPE scale.
+defaults:
+  - trl_regular
+  - _self_
+
+model:
+  patch_size: [4, 8]
+  rope_scale: [96, 32]

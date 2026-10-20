@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from wamrvit.quad.regrid_lineage import COARSEN_OP, REFINE_OP, LineagePlan
+from wamrvit.quad.array_regrid.core import COARSEN_OP, REFINE_OP, LineagePlan
 
 
 def _operation_generations(plan: LineagePlan) -> np.ndarray:

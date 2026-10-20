@@ -1,0 +1,17 @@
+# @package _global_
+# Raw PLI uniform-adaptive versus regular-finest ViT; full-field GT is retained.
+defaults:
+  - override /dataset: pli_adaptive
+  - override /mode: rollout_pli
+
+file_loader:
+  params:
+    return_src: True
+
+inference:
+  checkpoint_path_adaptive: ${checkpoint_root}/pli_adaptive/model
+  checkpoint_path_regular: ${checkpoint_root}/pli_regular/model
+  num_gpus_adaptive: 1
+  num_gpus_regular: 1
+  compute_uniform_metrics: True
+  output_csv: ${output_root}/rmse_combined_pli_uniform.csv

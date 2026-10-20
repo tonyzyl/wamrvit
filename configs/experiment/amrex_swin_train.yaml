@@ -1,0 +1,13 @@
+# @package _global_
+# Canonical revised AMReX Swin: p32, simulation level 2, fixed PF4.
+defaults:
+  - override /dataset: amrex_regular_swin
+  - override /mode: train
+
+train:
+  num_train_epochs: 600
+  save_every_epochs: 1000
+  num_push_forward_steps: 4
+
+general:
+  run_name: amrex_swin_p32

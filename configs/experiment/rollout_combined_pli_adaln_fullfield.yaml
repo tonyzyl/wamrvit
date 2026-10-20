@@ -1,0 +1,18 @@
+# @package _global_
+# Raw PLI native Conv3D/AdaLN/full-field versus regular-finest ViT.
+defaults:
+  - rollout_combined_pli_uniform
+  - _self_
+
+model:
+  multi_scale_patch: True
+  multi_scale_channel_mult: 2
+  level_conditioned_norm: True
+
+file_loader:
+  params:
+    value_storage: native
+
+inference:
+  checkpoint_path_adaptive: ${checkpoint_root}/pli_native_fullfield/model
+  output_csv: ${output_root}/rmse_combined_pli_native.csv

@@ -1,0 +1,14 @@
+# @package _global_
+# Existing TRL uniform-adaptive one-step test protocol; no inference regrid.
+defaults:
+  - override /dataset: trl_adaptive
+  - override /mode: rollout_trl
+
+file_loader:
+  params:
+    return_src: True
+
+inference:
+  checkpoint_path: ${checkpoint_root}/trl_uniform_adaptive/model
+  compute_uniform_metrics: True
+  output_csv: ${output_root}/rmse_trl_uniform_adaptive.csv

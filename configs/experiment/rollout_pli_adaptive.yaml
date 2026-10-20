@@ -1,0 +1,13 @@
+# @package _global_
+# Raw PLI uniform-adaptive PF1 evaluation with CPU eager array regridding and source GT.
+defaults:
+  - override /dataset: pli_adaptive
+  - override /mode: rollout_pli
+
+file_loader:
+  params:
+    return_src: True
+
+inference:
+  checkpoint_path: ${checkpoint_root}/pli_adaptive/model
+  output_csv: ${output_root}/rmse_pli_adaptive.csv

@@ -1,0 +1,35 @@
+# @package _global_
+# Portable single-GPU template. Override paths/resources for your installation.
+data_root: ${oc.env:DATA_ROOT,data}
+checkpoint_root: ${oc.env:CHECKPOINT_ROOT,checkpoints}
+output_root: ${oc.env:OUTPUT_ROOT,outputs}
+
+data_paths:
+  pli: ${data_root}/oceans11_pli/*.npz
+  amrex: ${data_root}/stratified_detonation/uni_stoich/plt/plt*
+  trl: ${data_root}/the_well/data/train/*.hdf5
+
+val_data_paths:
+  trl: ${data_root}/the_well/data/valid/*.hdf5
+
+test_data_paths:
+  trl: ${data_root}/the_well/data/test/*.hdf5
+
+train:
+  num_gpus: 1
+  actor_pool_size: 2
+  ray_stream_map_concurrency: 2
+  ray_stream_object_store_memory_gib: 16
+  ray_stream_node_headroom_gib: 4
+  resident_node_headroom_gib: 4
+
+inference:
+  num_cpus: 8
+  num_gpus: 1
+  ray_object_store_memory: 16
+
+general:
+  ray_object_store_memory: 16
+  seed: 42
+  save_dir: ${checkpoint_root}
+  ray_spill_dir: ${output_root}/ray_spill

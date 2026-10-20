@@ -9,38 +9,35 @@ import math
 import os
 import time
 import warnings
-from collections import defaultdict
 from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
 import ray
 import torch
-from numba import get_num_threads
 
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.dataloader.transform import apply_transform_src, inverse_transform_src
-from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid_native
-from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
-from wamrvit.quad.regrid_dispatch import (
-    regrid_native_dispatch,
-    regrid_uniform_dispatch,
-    regrid_uniform_sequence_dispatch,
-    RegridProfiler,
-)
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.selection.splits import prepare_evaluation_windows
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper, _copy_transport_control_columns
+from wamrvit.dataloader.payload.transforms import apply_transform_src
 from wamrvit.quad.quad_utils import (
+    make_regular_centers,
     quadtree_to_tensor,
-    tensor_to_quadtree,
     tensor_to_uniform,
 )
-from wamrvit.quad.yt_utils import make_regular_centers
-from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.rollout.regular_metrics import METRIC_REGISTRY, eval_per_level_metric
+from wamrvit.rollout.regular_metrics import (
+    METRIC_REGISTRY,
+    eval_per_level_metric,
+    mean_numeric_result_columns,
+    normalize_numeric_result_columns,
+)
 from wamrvit.rollout.rollout_adaptive import (
+    AutoregressivePredictorAdaptive,
     build_native_gt_buckets,
+    build_uniform_gt,
     eval_native_uniform_metrics,
     eval_per_level_metrics,
+    leaf_export_order,
 )
 from wamrvit.utils import instantiate_from_config, load_config
 
@@ -88,16 +85,16 @@ class CombinedMapper(Seq2SeqMapper):
     def __init__(self, loader, transform=None, regular_target_level: int = 0):
         super().__init__(loader=loader, transform=transform)
         # AMReX projection level for the *regular* path's input materialization.
-        # Must match the regular checkpoint's training projection: 0 for the
-        # _p8 mid baselines (256×1536), 2 for the p32 lvl-2 baselines
-        # (1024×6144). Mismatch on Swin raises AssertionError in timm's
-        # PatchEmbed; on the ViT path it runs silently OOD (no shape check).
+        # Must match the regular checkpoint's training projection: the paper
+        # p32 baselines use level 2 (1024×6144). Mismatch on Swin raises an
+        # AssertionError in timm's PatchEmbed; on the ViT path it runs silently
+        # OOD (no shape check).
         self.regular_target_level = int(regular_target_level)
 
     def __call__(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         timings: dict[str, float] = {}
         with _timer(timings, "time_mapper_total"):
-            result = self._call_inner(batch, timings)
+            result = _copy_transport_control_columns(self._call_inner(batch, timings), batch)
         for k, v in timings.items():
             result[k] = np.array([v], dtype=np.float32)
         return result
@@ -105,7 +102,7 @@ class CombinedMapper(Seq2SeqMapper):
     def _materialize_amrex_input_src(self, input_src_paths: list[str]) -> np.ndarray:
         """Load AMReX input frames via yt and return (T_in, C, H, W) numpy array."""
         if self._amrex_src_loader is None:
-            from wamrvit.dataloader.loader import YTAmReXRegularLoader
+            from wamrvit.dataloader.payload.loaders import YTAmReXRegularLoader
 
             self._amrex_src_loader = YTAmReXRegularLoader(
                 field_names=self.loader.field_names,
@@ -126,7 +123,8 @@ class CombinedMapper(Seq2SeqMapper):
         self, batch: dict[str, np.ndarray], timings: dict[str, float]
     ) -> dict[str, np.ndarray]:
         batch_size = len(batch["input_paths"])
-        assert batch_size == 1, f"Adaptive shall have batch size 1, but got {batch_size}"
+        if batch_size != 1:
+            raise ValueError(f"Adaptive shall have batch size 1, but got {batch_size}")
 
         with _timer(timings, "time_mapper_loader"):
             return_dict = self.loader(batch["input_paths"][0], batch["target_paths"][0])
@@ -157,7 +155,8 @@ class CombinedMapper(Seq2SeqMapper):
         centers_arr = [meta["centers"] if meta is not None else []]  # [(N, 3)]
         levels_arr = [meta["levels"] if meta is not None else []]  # [(N,)]
 
-        assert input_arr[0].ndim == 5, "Combined rollout requires AdaptiveLoader (5D input)"
+        if input_arr[0].ndim != 5:
+            raise ValueError("Combined rollout requires AdaptiveLoader (5D input)")
 
         # AMReX path-based delivery: loader emitted input_src_paths instead of
         # an eager input_src tensor. Materialize the tensor here via yt so the
@@ -226,116 +225,19 @@ class CombinedMapper(Seq2SeqMapper):
 # ---------------------------------------------------------------------------
 
 
-class AdaptivePredictor:
+class AdaptivePredictor(AutoregressivePredictorAdaptive):
+    """Shared adaptive rollout with the combined pipeline's timing and output schema."""
+
     def __init__(self, config: dict):
-        self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        super().__init__(config, checkpoint_key="checkpoint_path_adaptive")
 
-        inf_cfg = config["inference"]
-        ckpt = inf_cfg["checkpoint_path_adaptive"]
-        if inf_cfg.get("is_diffusers", False):
-            print("Loading adaptive model via diffusers from:", ckpt)
-            self.model = QuadTreeTransformer.from_pretrained(ckpt)
-        else:
-            print("Loading adaptive model state dict from:", ckpt)
-            self.model = QuadTreeTransformer(**config["model"])
-            state_dict = torch.load(ckpt, map_location="cpu")
-            if "module." in list(state_dict.keys())[0]:
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            self.model.load_state_dict(state_dict)
-
-        assert self.model.config.adaptive, "Loaded model must be an adaptive QuadTreeTransformer."
-        self.multi_scale = getattr(self.model.config, "multi_scale_patch", False)
-        self.num_levels = int(self.model.config.max_level_idx) + 1 if self.multi_scale else 0
-        self.model.to(self.device)
-        self.model.eval()
-
-        self.transform = instantiate_from_config(config["transform"])
-        self.predict_steps = inf_cfg.get("predict_steps", 1)
-        self.model_return_seq_len = self.model.config.return_seq_len
-        self.num_forward_calls = math.ceil(self.predict_steps / self.model_return_seq_len)
-        self.pred_mode = inf_cfg.get("pred_mode", "target")
-        self.regrid_interval = inf_cfg.get("regrid_interval", None)
-        self.regrid_adapt_nearby = inf_cfg.get("regrid_adapt_nearby", 0)
-
-        loader_params = config.get("file_loader", {}).get("params", {})
-        self.cell_scale_mode = loader_params.get("cell_scale_mode", "area")
-        self.adapt_on_channels = loader_params.get("adapt_on_channels", None)
-        self.tol_frac = loader_params.get("tol_frac", 0.01)
-        if inf_cfg.get("regrid_tol_frac") is not None:
-            self.regrid_tol_frac = inf_cfg["regrid_tol_frac"]
-            self.allow_coarsening = inf_cfg.get("allow_coarsening", True)
-        else:
-            warnings.warn(
-                "regrid_tol_frac not set in inference config, "
-                f"defaulting to file_loader's tol_frac={self.tol_frac}"
-            )
-            self.regrid_tol_frac = self.tol_frac
-
-        self.regrid_backend = inf_cfg.get("regrid_backend", "object")
-        self.array_regrid_value_storage = inf_cfg.get(
-            "array_regrid_value_storage", "copy")
-        self.array_regrid_payload_backend = inf_cfg.get(
-            "array_regrid_payload_backend", "cpu_eager"
-        )
-        if (
-            self.regrid_backend == "array"
-            and self.multi_scale
-            and self.array_regrid_payload_backend == "gpu_replay"
-        ):
-            raise ValueError(
-                "array_regrid_payload_backend=gpu_replay is supported only for "
-                "uniform-patch rollout."
-            )
-        self.array_regrid_capacity = int(inf_cfg.get("array_regrid_capacity", 8192))
-        self.array_regrid_num_threads = inf_cfg.get("array_regrid_num_threads")
-        if self.regrid_backend == "array":
-            configure_array_regrid_num_threads(self.array_regrid_num_threads)
-            print(
-                "Array regrid runtime: "
-                f"value_storage={self.array_regrid_value_storage}, "
-                f"payload_backend={self.array_regrid_payload_backend}, "
-                f"capacity={self.array_regrid_capacity}, "
-                f"numba_threads={get_num_threads()}, "
-                f"affinity_cpus={len(os.sched_getaffinity(0))}"
-            )
-        field_names = list(loader_params.get("field_names", []))
-        detector_channels = self.adapt_on_channels or list(range(len(field_names)))
-        self.regrid_detector_fields = tuple(
-            field_names[index] if index < len(field_names) else f"channel_{index}"
-            for index in detector_channels
-        )
-        # Profiling is opt-in (regrid_profile): default object rollouts stay
-        # side-effect-free -- no timing CSVs written. Active only for a comparison run.
-        self.regrid_profiler = RegridProfiler() if inf_cfg.get("regrid_profile", False) else None
-        _out_csv = inf_cfg.get("output_csv")
-        self.regrid_out_dir = os.path.dirname(_out_csv) if _out_csv else os.getcwd()
-
-        if (
-            self.regrid_interval is not None
-            and self.regrid_interval % self.model_return_seq_len != 0
-        ):
-            warnings.warn(
-                f"regrid_interval ({self.regrid_interval}) is not divisible by "
-                f"model return_seq_len ({self.model_return_seq_len}). Regridding "
-                f"will only occur at forward-call boundaries (every "
-                f"{self.model_return_seq_len} timesteps)."
-            )
-
-        if self.model.config.cell_scale_mode != self.cell_scale_mode:
-            warnings.warn(
-                f"Model cell_scale_mode ({self.model.config.cell_scale_mode}) does not match \
-                data loader's cell_scale_mode ({self.cell_scale_mode}), overriding loader's mode"
-            )
-            self.cell_scale_mode = self.model.config.cell_scale_mode
+    def _time_phase(self, name: str):
+        return _timer(self._timings, name, sync_cuda=True)
 
     def __call__(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         self._timings: dict[str, float] = {}
         with _timer(self._timings, "time_adaptive_total", sync_cuda=True):
-            if self.multi_scale:
-                out = self._call_native(batch)
-            else:
-                out = self._call_uniform(batch)
+            out = super().__call__(batch)
         # Normalization helpers: token count and step count for per-cell timing math.
         if "ref_centers" in out:
             ref = out["ref_centers"]
@@ -347,369 +249,20 @@ class AdaptivePredictor:
             out[k] = np.array([v], dtype=np.float32)
         return out
 
-    def _call_uniform(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        def _unpack(arr):
-            return arr[0] if arr.dtype == object else arr
-
-        input_np = _unpack(batch["input"])  # (1, N, C, T_in, Ph, Pw)
-        target_np = _unpack(batch["target"])  # (1, N, C, T_out, Ph, Pw)
-        target_src_np = (
-            _unpack(batch["target_src"]) if "target_src" in batch else None
-        )  # (T_out, C, H, W) after squeeze
-        target_src_paths = (
-            _unpack(batch["target_src_paths"]) if "target_src_paths" in batch else None
-        )
-        input_src_np = (
-            _unpack(batch["input_src"]) if "input_src" in batch else None
-        )  # (1, T_in, C, H, W)
-
-        inputs = torch.from_numpy(input_np).to(
-            self.device, dtype=torch.float32
-        )  # (1, N, C, T_in, Ph, Pw)
-        targets = torch.from_numpy(target_np).to(self.device, dtype=torch.float32)
-
-        domain = {
-            k: _unpack(batch[k]).item()
-            for k in ["xmin", "xmax", "ymin", "ymax", "max_level_idx", "tile_width", "tile_height"]
-        }
-        ref_centers_np = _unpack(batch["centers"])
-        ref_levels_np = _unpack(batch["levels"])
-        ref_meta = {"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain}
-        meta = ref_meta
-
-        centers = torch.from_numpy(ref_centers_np).to(self.device, dtype=torch.float32)
-
-        if inputs.ndim == 6:
-            # Strip ray-batch axis → (N, C, T_in, Ph, Pw).
-            inputs = inputs.squeeze(0)
-            targets = targets.squeeze(0)
-            centers = centers.squeeze(0)  # (N, 3)
-            ref_centers_np = ref_centers_np.squeeze(0)
-            ref_levels_np = ref_levels_np.squeeze(0)
-            ref_meta["centers"] = ref_centers_np
-            ref_meta["levels"] = ref_levels_np
-
-        N_grids, C, T_in, H, W = inputs.shape  # H == Ph, W == Pw
-        R = self.model_return_seq_len
-
-        curr_input_seq = inputs.clone()  # (N, C, T_in, Ph, Pw)
-        all_preds = []  # list[(N, C, 1, Ph, Pw)]
-        all_centers = []  # list[(N, 3)]
-        all_levels = []  # list[(N,)]
-
-        if self.regrid_profiler is not None:
-            self.regrid_profiler.new_sample()
-        with torch.no_grad():
-            for call_idx in range(self.num_forward_calls):
-                timestep_idx = call_idx * R
-                steps_this_call = min(R, self.predict_steps - timestep_idx)
-
-                if (
-                    self.regrid_interval is not None
-                    and timestep_idx > 0
-                    and timestep_idx % self.regrid_interval == 0
-                ):
-                    with _timer(self._timings, "time_adaptive_regrid", sync_cuda=True):
-                        N, c_in, t_in, h, w = curr_input_seq.shape
-                        ch_offset = (t_in - 1) * c_in
-                        use_channels = (
-                            [ch + ch_offset for ch in self.adapt_on_channels]
-                            if self.adapt_on_channels is not None
-                            else list(range(ch_offset, t_in * c_in))
-                        )
-                        if self.regrid_backend == "array":
-                            sequence_input = (
-                                curr_input_seq
-                                if self.array_regrid_payload_backend == "gpu_replay"
-                                else curr_input_seq.detach().cpu().numpy()
-                            )
-                            new_sequence_np, meta = regrid_uniform_sequence_dispatch(
-                                sequence_input,
-                                meta,
-                                backend="array",
-                                profiler=self.regrid_profiler,
-                                max_passes=10,
-                                cell_scale_mode=self.cell_scale_mode,
-                                tol_frac=self.regrid_tol_frac,
-                                channel=use_channels,
-                                adapt_nearby=self.regrid_adapt_nearby,
-                                allow_coarsening=self.allow_coarsening,
-                                value_storage=self.array_regrid_value_storage,
-                                capacity=self.array_regrid_capacity,
-                                payload_backend=self.array_regrid_payload_backend,
-                                detector_channels=self.adapt_on_channels,
-                                detector_fields=self.regrid_detector_fields,
-                            )
-                        else:
-                            # Preserve the established object flatten/build/export path.
-                            flat_input = (
-                                curr_input_seq.transpose(1, 2)
-                                .contiguous()
-                                .view(N, t_in * c_in, h, w)
-                                .cpu()
-                                .numpy()
-                            )
-                            new_input_np, meta = regrid_uniform_dispatch(
-                                flat_input,
-                                meta,
-                                backend="object",
-                                profiler=self.regrid_profiler,
-                                max_passes=10,
-                                cell_scale_mode=self.cell_scale_mode,
-                                tol_frac=self.regrid_tol_frac,
-                                channel=use_channels,
-                                adapt_nearby=self.regrid_adapt_nearby,
-                                allow_coarsening=self.allow_coarsening,
-                            )
-                            new_N = new_input_np.shape[0]
-                            new_sequence_np = np.ascontiguousarray(
-                                new_input_np.reshape(new_N, t_in, c_in, h, w)
-                                .transpose(0, 2, 1, 3, 4))
-
-                        centers = torch.from_numpy(meta["centers"]).to(
-                            self.device, dtype=torch.float32)
-                        curr_input_seq = (
-                            new_sequence_np.to(self.device, dtype=torch.float32)
-                            if isinstance(new_sequence_np, torch.Tensor)
-                            else torch.from_numpy(new_sequence_np).to(
-                                self.device, dtype=torch.float32
-                            )
-                        )
-
-                with _timer(self._timings, "time_adaptive_forward", sync_cuda=True):
-                    pred_full = self.model(curr_input_seq, centers)  # (N, C, R, Ph, Pw)
-
-                with _timer(self._timings, "time_adaptive_post", sync_cuda=True):
-                    if self.pred_mode == "residual":
-                        pred_full = pred_full + curr_input_seq[:, :, -1].unsqueeze(
-                            2
-                        )  # (N, C, R, Ph, Pw)
-
-                    pred_to_store = pred_full[
-                        :, :, :steps_this_call
-                    ]  # (N, C, steps_this_call, Ph, Pw)
-                    pred_np = pred_to_store.cpu().numpy()
-                    if hasattr(self.transform, "inverse_transform") and callable(
-                        self.transform.inverse_transform
-                    ):
-                        pred_phys = self.transform.inverse_transform(pred_np)
-                    else:
-                        pred_phys = pred_np
-
-                for t in range(steps_this_call):
-                    all_preds.append(pred_phys[:, :, t : t + 1])
-                    all_centers.append(meta["centers"])
-                    all_levels.append(meta["levels"])
-
-                if call_idx < self.num_forward_calls - 1:
-                    num_from_input = max(T_in - R, 0)
-                    if num_from_input > 0:
-                        curr_input_seq = torch.cat(
-                            (curr_input_seq[:, :, -num_from_input:], pred_full), dim=2
-                        )
-                    else:
-                        curr_input_seq = pred_full[:, :, -T_in:]
-
-        gt_np = targets.cpu().numpy()
-        if hasattr(self.transform, "inverse_transform") and callable(
-            self.transform.inverse_transform
+    def _format_output(self, out: dict, batch: dict, *, leaf_to_bucket=None) -> dict:
+        for key in (
+            "preds_list", "preds_by_level_list", "leaf_to_bucket_list",
+            "centers_list", "levels_list",
         ):
-            gt_phys = self.transform.inverse_transform(gt_np)
-        else:
-            gt_phys = gt_np
-
-        out = {
-            "adaptive_preds_list": np.empty(1, dtype=object),
-            "adaptive_centers_list": np.empty(1, dtype=object),
-            "adaptive_levels_list": np.empty(1, dtype=object),
-            "target": np.expand_dims(gt_phys, 0),
-            "ref_centers": np.expand_dims(ref_meta["centers"], 0),
-            "ref_levels": np.expand_dims(ref_meta["levels"], 0),
-        }
-        out["adaptive_preds_list"][0] = all_preds
-        out["adaptive_centers_list"][0] = all_centers
-        out["adaptive_levels_list"][0] = all_levels
-
-        if target_src_np is not None:
-            target_src_np = inverse_transform_src(self.transform, target_src_np)
-            out["target_src"] = target_src_np
-        if target_src_paths is not None:
-            out["target_src_paths"] = np.empty(1, dtype=object)
-            out["target_src_paths"][0] = target_src_paths
-        if input_src_np is not None:
-            out["input_src"] = input_src_np
-
-        for k, v in ref_meta["domain"].items():
-            out[f"domain_{k}"] = np.expand_dims(np.array([v]), 0)
-
-        for key in ("idx", "traj_idx", "frame_idx"):
-            if key in batch:
-                out[key] = batch[key]
-
-        if self.regrid_profiler is not None:
-            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
-        return out
-
-    def _call_native(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Native (multi-scale) rollout for combined pipeline."""
-
-        def _unpack(arr):
-            return arr[0] if arr.dtype == object else arr
-
-        target_src_np = _unpack(batch["target_src"]) if "target_src" in batch else None
-        input_src_np = _unpack(batch["input_src"]) if "input_src" in batch else None
-
-        inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_native_batch(
-            batch,
-            self.num_levels,
-            self.device,
-            non_blocking=False,
-        )
-
-        domain = {
-            k: _unpack(batch[k]).item()
-            for k in ["xmin", "xmax", "ymin", "ymax", "max_level_idx", "tile_width", "tile_height"]
-        }
-        ref_centers_np = _unpack(batch["centers"])
-        ref_levels_np = _unpack(batch["levels"])
-        if ref_centers_np.ndim == 3:
-            ref_centers_np = ref_centers_np.squeeze(0)
-        if ref_levels_np.ndim == 2:
-            ref_levels_np = ref_levels_np.squeeze(0)
-
-        ref_meta = {"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain}
-        meta = ref_meta
-
-        R = self.model_return_seq_len
-        T_in = next(v.shape[2] for v in inputs_by_level.values() if v.shape[0] > 0)
-
-        curr_by_level = {lvl: v.clone() for lvl, v in inputs_by_level.items()}
-
-        all_preds_by_level = []
-        all_leaf_to_bucket = []
-        all_centers = []
-        all_levels = []
-
-        if self.regrid_profiler is not None:
-            self.regrid_profiler.new_sample()
-        with torch.no_grad():
-            for call_idx in range(self.num_forward_calls):
-                timestep_idx = call_idx * R
-                steps_this_call = min(R, self.predict_steps - timestep_idx)
-
-                if (
-                    self.regrid_interval is not None
-                    and timestep_idx > 0
-                    and timestep_idx % self.regrid_interval == 0
-                ):
-                    with _timer(self._timings, "time_adaptive_regrid", sync_cuda=True):
-                        C_orig = T_in_val = None
-                        for arr in curr_by_level.values():
-                            if arr.shape[0] > 0:
-                                C_orig, T_in_val = arr.shape[1], arr.shape[2]
-                                break
-                        np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
-                        new_np, new_l2b, meta = regrid_native_dispatch(
-                            np_by_level,
-                            leaf_to_bucket.cpu().numpy(),
-                            meta,
-                            backend=self.regrid_backend,
-                            profiler=self.regrid_profiler,
-                            C=C_orig,
-                            T=T_in_val,
-                            tol_frac=self.regrid_tol_frac,
-                            cell_scale_mode=self.cell_scale_mode,
-                            adapt_on_channels=self.adapt_on_channels,
-                            adapt_nearby=self.regrid_adapt_nearby,
-                            allow_coarsening=self.allow_coarsening,
-                        )
-                        curr_by_level = {
-                            lvl: torch.from_numpy(arr).to(self.device, dtype=torch.float32)
-                            for lvl, arr in new_np.items()
-                        }
-                        leaf_to_bucket = torch.from_numpy(new_l2b).to(self.device).long()
-                        centers = torch.from_numpy(meta["centers"]).to(
-                            self.device, dtype=torch.float32
-                        )
-
-                with _timer(self._timings, "time_adaptive_forward", sync_cuda=True):
-                    pred_by_level = self.model.forward_multi_scale(
-                        curr_by_level,
-                        leaf_to_bucket,
-                        centers,
-                    )
-
-                with _timer(self._timings, "time_adaptive_post", sync_cuda=True):
-                    if self.pred_mode == "residual":
-                        for lvl in pred_by_level:
-                            pred_by_level[lvl] = pred_by_level[lvl] + curr_by_level[lvl][:, :, -1:]
-
-                    for t in range(steps_this_call):
-                        step_pred = {}
-                        for lvl, arr in pred_by_level.items():
-                            slice_np = arr[:, :, t : t + 1].cpu().numpy()
-                            if hasattr(self.transform, "inverse_transform") and callable(
-                                self.transform.inverse_transform
-                            ):
-                                slice_np = self.transform.inverse_transform(slice_np)
-                            step_pred[lvl] = slice_np
-                        all_preds_by_level.append(step_pred)
-                        all_leaf_to_bucket.append(leaf_to_bucket.cpu().numpy())
-                        all_centers.append(meta["centers"])
-                        all_levels.append(meta["levels"])
-
-                if call_idx < self.num_forward_calls - 1:
-                    num_from_input = max(T_in - R, 0)
-                    for lvl in curr_by_level:
-                        if num_from_input > 0:
-                            curr_by_level[lvl] = torch.cat(
-                                (curr_by_level[lvl][:, :, -num_from_input:], pred_by_level[lvl]),
-                                dim=2,
-                            )
-                        else:
-                            curr_by_level[lvl] = pred_by_level[lvl][:, :, -T_in:]
-
-        gt_by_level = {}
-        for lvl, arr in targets_by_level.items():
-            gt_np = arr.cpu().numpy()
-            if hasattr(self.transform, "inverse_transform") and callable(
-                self.transform.inverse_transform
-            ):
-                gt_np = self.transform.inverse_transform(gt_np)
-            gt_by_level[lvl] = gt_np
-
-        out = {
-            "native_mode": np.array([1], dtype=np.int32),
-            "adaptive_preds_by_level_list": np.empty(1, dtype=object),
-            "adaptive_leaf_to_bucket_list": np.empty(1, dtype=object),
-            "adaptive_centers_list": np.empty(1, dtype=object),
-            "adaptive_levels_list": np.empty(1, dtype=object),
-            "ref_centers": np.expand_dims(ref_meta["centers"], 0),
-            "ref_levels": np.expand_dims(ref_meta["levels"], 0),
-        }
-        out["adaptive_preds_by_level_list"][0] = all_preds_by_level
-        out["adaptive_leaf_to_bucket_list"][0] = all_leaf_to_bucket
-        out["adaptive_centers_list"][0] = all_centers
-        out["adaptive_levels_list"][0] = all_levels
-
-        out["gt_by_level"] = np.empty(1, dtype=object)
-        out["gt_by_level"][0] = gt_by_level
-
-        if target_src_np is not None:
-            target_src_np = inverse_transform_src(self.transform, target_src_np)
-            out["target_src"] = target_src_np
-        if input_src_np is not None:
-            out["input_src"] = input_src_np
-
-        for k, v in ref_meta["domain"].items():
-            out[f"domain_{k}"] = np.expand_dims(np.array([v]), 0)
-
-        for key in ("idx", "traj_idx", "frame_idx"):
-            if key in batch:
-                out[key] = batch[key]
-
-        if self.regrid_profiler is not None:
-            self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
+            if key in out:
+                out[f"adaptive_{key}"] = out.pop(key)
+        # Only combined rollout forwards the regular model's dense input. Do not
+        # add multi-GiB AMReX payloads to adaptive-only Ray output, or copy them here.
+        if "input_src" in batch:
+            source = batch["input_src"]
+            source = source[0] if source.dtype == object else source
+            if source is not None:
+                out["input_src"] = source
         return out
 
 
@@ -726,33 +279,7 @@ class RegularPredictor:
         inf_cfg = config["inference"]
         ckpt = inf_cfg["checkpoint_path_regular"]
 
-        # Detect model class from checkpoint config
-        model_class_name = "QuadTreeTransformer"
-        if inf_cfg.get("is_diffusers", False):
-            import json
-
-            ckpt_config_path = os.path.join(ckpt, "config.json")
-            if os.path.exists(ckpt_config_path):
-                with open(ckpt_config_path) as f:
-                    model_class_name = json.load(f).get("_class_name", model_class_name)
-
-        if model_class_name == "SwinV2Transformer":
-            from wamrvit.swin_transformer import SwinV2Transformer
-
-            model_cls = SwinV2Transformer
-        else:
-            model_cls = QuadTreeTransformer
-
-        if inf_cfg.get("is_diffusers", False):
-            print("Loading regular model via diffusers from:", ckpt)
-            self.model = model_cls.from_pretrained(ckpt)
-        else:
-            print("Loading regular model state dict from:", ckpt)
-            self.model = model_cls(**config.get("model_regular", config["model"]))
-            state_dict = torch.load(ckpt, map_location="cpu")
-            if "module." in list(state_dict.keys())[0]:
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            self.model.load_state_dict(state_dict)
+        self.model = load_model(ckpt, config.get("model_regular", config["model"]))
 
         self.model.to(self.device)
         self.model.eval()
@@ -851,9 +378,9 @@ class CombinedMetricEvaluator:
     Compute per-level and uniform-grid metrics for both adaptive and regular models.
     All metrics are driven by METRIC_REGISTRY via config ``metrics``.
 
-    Supports GT from:
-      1. target_src (numpy array) — NPZ mode with return_src=True
-      2. target_src_paths (file paths) — AMReX mode with return_src=True
+    Requires source GT (return_src=True):
+      1. target_src (numpy array) — uniform or native mode
+      2. target_src_paths (file paths) — uniform-patch AMReX mode only
     """
 
     def __init__(self, config: dict):
@@ -903,6 +430,11 @@ class CombinedMetricEvaluator:
         target_src_paths = (
             _unpack(batch["target_src_paths"]) if "target_src_paths" in batch else None
         )
+        if target_src is None and target_src_paths is None:
+            raise ValueError(
+                "Combined evaluation requires target_src or target_src_paths. "
+                "Set return_src=True in file_loader config."
+            )
         if target_src is not None:
             while target_src.ndim > 4 and target_src.shape[0] == 1:
                 target_src = target_src.squeeze(0)
@@ -948,52 +480,36 @@ class CombinedMetricEvaluator:
             if pred_regular.ndim == 4:
                 pred_regular = pred_regular[:, 0]
 
-            N_step = pred_adaptive.shape[0]
-            c_out, _, ph, pw = pred_adaptive.shape[1:]
             step_meta = {"centers": step_centers, "levels": step_levels, "domain": domain}
 
             reg_pred_frame = pred_regular  # (C, H, W)
             adaptive_frame = pred_adaptive[:, :, 0, :, :]  # (N_step, C, Ph, Pw)
 
-            gt_on_qt = None
-            gt_src_frame = None
             with _timer(self._timings, "time_eval_gt_assembly"):
-                if target_src is not None:
-                    gt_src_frame = target_src[step]
-                    qt_struct = tensor_to_quadtree(
-                        np.zeros((N_step, c_out, ph, pw), dtype=np.float32),
-                        step_meta,
-                        cell_scale_mode=self.cell_scale_mode,
-                    )
-                    qt_struct.assign_from_array(gt_src_frame)
-                    gt_on_qt, _ = quadtree_to_tensor(
-                        qt_struct, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                    )
-                elif target_src_paths is not None:
-                    from wamrvit.quad.amrex_to_qt import assign_from_amrex
-
-                    qt_struct = tensor_to_quadtree(
-                        np.zeros((N_step, c_out, ph, pw), dtype=np.float32),
-                        step_meta,
-                        cell_scale_mode=self.cell_scale_mode,
-                    )
-                    assign_from_amrex(
-                        qt_struct,
-                        target_src_paths[step],
-                        self.amrex_field_names,
-                        patch_size=self.amrex_patch_size,
-                    )
-                    gt_on_qt, _ = quadtree_to_tensor(
-                        qt_struct, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                    )
-                else:
-                    continue
+                gt_src_frame = target_src[step] if target_src is not None else None
+                gt_on_qt, qt_struct = build_uniform_gt(
+                    adaptive_frame,
+                    step_meta,
+                    gt_src_frame=gt_src_frame,
+                    gt_src_path=(
+                        target_src_paths[step]
+                        if target_src is None and target_src_paths is not None else None
+                    ),
+                    amrex_field_names=self.amrex_field_names,
+                    amrex_patch_size=self.amrex_patch_size,
+                    cell_scale_mode=self.cell_scale_mode,
+                )
 
                 # Project regular-model frame onto adaptive quadtree → (N_step, C, Ph, Pw).
                 qt_struct.assign_from_array(reg_pred_frame)
-                reg_on_qt, _ = quadtree_to_tensor(
+                reg_on_qt, reg_meta = quadtree_to_tensor(
                     qt_struct, return_tensor=False, cell_scale_mode=self.cell_scale_mode
                 )
+                order = leaf_export_order(
+                    qt_struct, reg_meta, step_meta, cell_scale_mode=self.cell_scale_mode
+                )
+                if order is not None:
+                    reg_on_qt = reg_on_qt[order]
 
             with _timer(self._timings, "time_eval_perlevel"):
                 unique_levels = np.unique(step_levels)
@@ -1070,9 +586,13 @@ class CombinedMetricEvaluator:
         regular_preds_list = _unpack(batch["regular_preds_list"])
 
         target_src = _unpack(batch["target_src"]) if "target_src" in batch else None
-        if target_src is not None:
-            while target_src.ndim > 4 and target_src.shape[0] == 1:
-                target_src = target_src.squeeze(0)
+        if target_src is None:
+            raise ValueError(
+                "Native combined evaluation requires dense target_src. "
+                "Set return_src=True in file_loader config."
+            )
+        while target_src.ndim > 4 and target_src.shape[0] == 1:
+            target_src = target_src.squeeze(0)
 
         domain = {
             k: _unpack(batch[f"domain_{k}"]).item()
@@ -1123,8 +643,6 @@ class CombinedMetricEvaluator:
                 pred_regular = pred_regular[:, 0]
             reg_pred_frame = pred_regular  # (C, H, W)
 
-            if target_src is None:
-                continue
             gt_src_frame = target_src[step]  # (C, H, W)
 
             # Build GT per-level and project regular predictions onto native quadtree.
@@ -1225,58 +743,27 @@ def main():
     config["inference"]["model_name_regular"] = regular_name
 
     default_csv = f"rmse_combined_{adaptive_name}_vs_{regular_name}_steps{steps}.csv"
+    if config["inference"].get("split_policy", "internal") != "prepartitioned":
+        default_csv = default_csv.removesuffix(".csv") + "_heldout.csv"
     csv_path = config["inference"].get("output_csv") or os.path.join("results", default_csv)
     if not os.path.isabs(csv_path):
         csv_path = os.path.abspath(os.path.join(base_dir, csv_path))
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     config["inference"]["output_csv"] = csv_path
 
-    if not ray.is_initialized():
-        ray.init(
-            object_store_memory=config["inference"].get("ray_object_store_memory", 10)
-            * 1024
-            * 1024
-            * 1024
-        )
-
     # --- Build windows ---
     data_config = config["data"]
     file_parser = instantiate_from_config(config["file_parser"])
     all_paths = file_parser(data_config["glob_pattern"])
 
-    window_config = dict(config["window_generator"])
-    window_config["params"]["return_seq_len"] = steps
-    params = dict(window_config.get("params", {}))
-    params["file_path_list"] = all_paths
-    window_config["params"] = params
-    windows = instantiate_from_config(window_config)
-
-    split_idx = int(len(windows) * config["inference"].get("split_ratio", 0.8))
-    windows = windows[split_idx:]
-
-    if not args.eval_full:
-        windows = windows[::steps]
-        print(f"Evaluating every {steps} steps. Total evaluation samples: {len(windows)}")
-
-    if args.debug:
-        windows = windows[:100]
-
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            w["idx"] = i
-
-    total_samples = len(windows)
-    traj_to_indices = defaultdict(list)
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            t_id = w.get("traj_idx", 0)
-            traj_to_indices[t_id].append(i)
-
-    print(
-        f"Total samples in validation split: {total_samples}, "
-        f"Trajectories: {len(traj_to_indices)}\n"
+    windows = prepare_evaluation_windows(
+        all_paths, config, eval_full=args.eval_full, debug=args.debug,
     )
 
+    if not ray.is_initialized():
+        ray.init(
+            object_store_memory=config["inference"].get("ray_object_store_memory", 10) * 1024**3
+        )
     ds = ray.data.from_items(windows)
 
     # --- Data loading ---
@@ -1369,7 +856,7 @@ def main():
     eval_fields = data_config["field_names"]
     max_level_idx = int(config["file_loader"]["params"].get("num_levels", 3)) - 1
 
-    mean_vals = df.mean(numeric_only=True)
+    mean_vals = mean_numeric_result_columns(df)
 
     results_dict = {"Step": []}
 
@@ -1453,10 +940,10 @@ def main():
     time_cols = sorted(c for c in df.columns if c.startswith("time_"))
     if time_cols:
         n = len(df)
-        means = df[time_cols].mean(numeric_only=True)
-        sums = df[time_cols].sum(numeric_only=True)
+        means = mean_vals[time_cols]
+        sums = normalize_numeric_result_columns(df[time_cols]).sum(skipna=True, min_count=1)
         n_tok_col = "adaptive_n_tokens" if "adaptive_n_tokens" in df.columns else None
-        n_tok_mean = float(df[n_tok_col].mean()) if n_tok_col else float("nan")
+        n_tok_mean = float(mean_vals[n_tok_col]) if n_tok_col else float("nan")
 
         print(
             f"\n--- Timing Profile (n={n} samples"
@@ -1494,9 +981,12 @@ def main():
         # Diagnostic summary: highest-cost sub-stage within each bucket.
         print("\n--- Where to attack first ---")
         for bkt, tot in bucket_totals.items():
-            if tot <= 0:
+            if not tot > 0:
                 continue
-            sub_cols = [c for c in time_cols if _bucket_for(c) == bkt and not c.endswith("_total")]
+            sub_cols = [
+                c for c in time_cols
+                if _bucket_for(c) == bkt and not c.endswith("_total") and pd.notna(means[c])
+            ]
             if not sub_cols:
                 continue
             top = max(sub_cols, key=lambda c: float(means[c]))

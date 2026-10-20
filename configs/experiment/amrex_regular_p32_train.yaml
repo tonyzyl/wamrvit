@@ -1,0 +1,4 @@
+# @package _global_
+# Explicit p32 name for the canonical AMReX regular ViT recipe.
+defaults:
+  - amrex_regular_train

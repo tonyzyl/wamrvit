@@ -1,0 +1,8 @@
+# @package _global_
+# AMReX animation: source-backed uniform GPU payload replay, existing object fallback.
+defaults:
+  - override /dataset: amrex_adaptive
+  - override /mode: animate_amrex
+
+inference:
+  checkpoint_path: ${checkpoint_root}/amrex_adaptive/model

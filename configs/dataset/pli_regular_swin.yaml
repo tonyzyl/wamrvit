@@ -1,0 +1,33 @@
+# @package _global_
+# Revised PLI Swin, finest patch [10, 5], 1120 x 400 image, four-stage FPN.
+
+defaults:
+  - _pli_common
+
+model:
+  _class_name: SwinV2Transformer
+  in_channels: 10
+  patch_size: [10, 5]   # matches pli_regular.yaml finest patch for fair comparison
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  swin_embed_dim: 192
+  swin_depths: [8, 12, 12, 6]   # revised four-stage hierarchy
+  swin_num_heads: [6, 12, 24, 48]
+  swin_window_size: 2
+  swin_pretrained: False
+  img_size: [1120, 400]
+  decoder_channels: 256
+  decoder_refinement_blocks: 2
+  adaptive: False
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.NpzRegularLoader
+  params:
+    field_names: ${fields.all}
+    coarsen_factor: 1
+    coarsen_mode: mean
+
+transform:
+  target: wamrvit.dataloader.payload.transforms.PLIRegularTransform
+  params:
+    field_names: ${fields.all}

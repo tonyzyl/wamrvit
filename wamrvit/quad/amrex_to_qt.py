@@ -14,8 +14,10 @@ Performance notes:
 
 from __future__ import annotations
 
+import mmap
 import os
 import re
+import time
 from typing import Any
 
 import numpy as np
@@ -85,6 +87,62 @@ def read_plotfile_header(plotfile_path: str) -> dict[str, Any]:
         "dx": dx,
         "ref_ratios": ref_ratios,
     }
+
+
+def amrex_leaf_geometry(
+    meta: dict[str, Any],
+    header_info: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    """Map ``levels (N,)`` to root ``(2,)`` and leaf support ``(N, 2)``."""
+    domain = meta["domain"]
+    index_extent = np.array(
+        [
+            float(domain["xmax"]) - float(domain["xmin"]),
+            float(domain["ymax"]) - float(domain["ymin"]),
+        ],
+        dtype=np.float64,
+    )  # (2,) quadtree-index domain size in x/y
+    physical_extent = (
+        np.asarray(header_info["domain_hi"], dtype=np.float64)
+        - np.asarray(header_info["domain_lo"], dtype=np.float64)
+    )
+    physical_extent = physical_extent[:2]  # (D_domain,) -> (2,) physical x/y size
+    root_extent = np.array(
+        [float(domain["tile_width"]), float(domain["tile_height"])],
+        dtype=np.float64,
+    )  # (2,) level-zero root size in quadtree coordinates
+    root_support = (physical_extent * root_extent / index_extent).astype(
+        np.float32
+    )  # (2,) physical (H_x, H_y) at level zero
+    levels = np.asarray(meta["levels"])  # (N,)
+    level_scale = np.exp2(levels.astype(np.float32))[:, None]  # (N,) -> (N, 1)
+    leaf_support = root_support[None, :] / level_scale  # (1, 2)/(N, 1) -> (N, 2)
+    return {
+        "root_support_xy": root_support,
+        "leaf_support_xy": leaf_support.astype(np.float32, copy=False),
+    }
+
+
+def _import_yt_utils():
+    """Lazy import yt and helpers needed only by YTAmReXRegularLoader."""
+    import yt
+
+    from wamrvit.quad.quad_utils import make_regular_centers
+    from wamrvit.quad.yt_utils import (
+        extract_amr_patches,
+        make_regular_target_from_amrex,
+        remap_amrex_to_regular,
+        remap_kernel,
+    )
+
+    return (
+        yt,
+        extract_amr_patches,
+        remap_kernel,
+        remap_amrex_to_regular,
+        make_regular_target_from_amrex,
+        make_regular_centers,
+    )
 
 
 def _parse_box(box_str: str) -> tuple[np.ndarray, np.ndarray]:
@@ -200,50 +258,75 @@ def read_plotfile_level(
     for i, (fab_file, fab_offset) in enumerate(fab_entries):
         file_groups[fab_file].append((i, fab_offset))
 
-    grid_data = np.zeros((total_subgrids, C, patch_h, patch_w), dtype=np.float32)
+    grid_data = np.empty((total_subgrids, C, patch_h, patch_w), dtype=np.float32)
 
     for fab_file, entries in file_groups.items():
         fab_path = os.path.join(level_dir, fab_file)
         with open(fab_path, "rb") as f:
-            raw = f.read()
+            raw = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
+        arr = None
+        c_data = None
 
         for grid_idx, offset in entries:
             grid_nx, grid_ny, nsub_x, nsub_y = box_dims[grid_idx]
             # Skip ASCII FAB header line (ends with \n)
-            header_end = raw.index(b"\n", offset) + 1
+            header_end = raw.find(b"\n", offset) + 1
+            if header_end == 0:
+                raw.close()
+                raise ValueError(f"Missing FAB header terminator in {fab_path}")
             data_start = header_end
 
-            # Read this FAB's full (C, grid_ny, grid_nx) buffer at native dims.
-            fab_buf = np.empty((C, grid_ny, grid_nx), dtype=np.float32)
+            # Tile directly into the final FP32 level buffer. Selective reads
+            # avoid a full FAB-sized FP32 temporary and its second copy.
+            base_out = int(sub_offset[grid_idx])
             if field_indices is not None:
-                # Selective field extraction
                 for out_c, field_c in enumerate(field_indices):
                     field_offset = data_start + field_c * grid_nx * grid_ny * 8
                     arr = np.frombuffer(
-                        raw, dtype=np.float64, count=grid_nx * grid_ny, offset=field_offset
+                        raw,
+                        dtype=np.float64,
+                        count=grid_nx * grid_ny,
+                        offset=field_offset,
                     )
-                    # AMReX FAB layout: x varies fastest. Reshape (ny, nx) C-order
-                    # matches yt's grid[f].d[:,:,0].T
-                    fab_buf[out_c] = arr.reshape(grid_ny, grid_nx).astype(np.float32)
+                    c_data = arr.reshape(grid_ny, grid_nx)
+                    for sy in range(nsub_y):
+                        y0 = sy * patch_h
+                        for sx in range(nsub_x):
+                            x0 = sx * patch_w
+                            out_idx = base_out + sy * nsub_x + sx
+                            grid_data[out_idx, out_c] = c_data[
+                                y0 : y0 + patch_h, x0 : x0 + patch_w
+                            ]
             else:
-                arr = np.frombuffer(
-                    raw, dtype=np.float64, count=ncomp_total * grid_nx * grid_ny, offset=data_start
+                fab_buf = np.empty(
+                    (C, grid_ny, grid_nx), dtype=np.float32
                 )
-                # Reshape each component: (ny, nx) C-order matches yt convention
+                arr = np.frombuffer(
+                    raw,
+                    dtype=np.float64,
+                    count=ncomp_total * grid_nx * grid_ny,
+                    offset=data_start,
+                )
+                # Preserve the legacy all-field storage-order behavior.
                 for c in range(ncomp_total):
-                    c_data = arr[c * grid_nx * grid_ny : (c + 1) * grid_nx * grid_ny]
+                    c_data = arr[
+                        c * grid_nx * grid_ny : (c + 1) * grid_nx * grid_ny
+                    ]
                     fab_buf[c] = c_data.reshape(
-                        grid_ny, grid_nx
+                        grid_ny, grid_nx, order="F"
                     ).astype(np.float32)
+                for sy in range(nsub_y):
+                    y0 = sy * patch_h
+                    for sx in range(nsub_x):
+                        x0 = sx * patch_w
+                        out_idx = base_out + sy * nsub_x + sx
+                        grid_data[out_idx] = fab_buf[
+                            :, y0 : y0 + patch_h, x0 : x0 + patch_w
+                        ]
 
-            # Tile the FAB into patch-sized subgrids (row-major by subgrid index).
-            base_out = int(sub_offset[grid_idx])
-            for sy in range(nsub_y):
-                y0 = sy * patch_h
-                for sx in range(nsub_x):
-                    x0 = sx * patch_w
-                    out_idx = base_out + sy * nsub_x + sx
-                    grid_data[out_idx] = fab_buf[:, y0:y0 + patch_h, x0:x0 + patch_w]
+        arr = None
+        c_data = None
+        raw.close()
 
     # Build grid_info with physical-space coordinates for each subgrid
     dx = header_info["dx"][level]
@@ -314,97 +397,253 @@ def read_plotfile_raw(
     return grid_info, grid_data, header_info
 
 
-@njit(parallel=False, fastmath=True, boundscheck=True, cache=True)
+@njit(fastmath=True, boundscheck=True, cache=True, inline="always")
+def _fast_sample_one_leaf_into(
+    i: int,
+    leaf_bounds: np.ndarray,
+    grid_info: np.ndarray,
+    grid_data: np.ndarray,
+    patch_size: tuple[int, int],
+    out_values: np.ndarray,
+) -> None:
+    N_grids = grid_info.shape[0]
+    C = grid_data.shape[1]
+    l_xmin = leaf_bounds[i, 0]
+    l_xmax = leaf_bounds[i, 1]
+    l_ymin = leaf_bounds[i, 2]
+    l_ymax = leaf_bounds[i, 3]
+
+    # A leaf intersects far fewer grids in production, but this fixed-size
+    # buffer preserves the validated sampler's behavior and bounds check.
+    valid_grids = np.zeros(2000, dtype=np.int32)
+    num_valid = 0
+
+    for g in range(N_grids):
+        g_xmin = grid_info[g, 1]
+        g_xmax = grid_info[g, 2]
+        g_ymin = grid_info[g, 3]
+        g_ymax = grid_info[g, 4]
+
+        if (max(l_xmin, g_xmin) < min(l_xmax, g_xmax)) and (
+            max(l_ymin, g_ymin) < min(l_ymax, g_ymax)
+        ):
+            if num_valid < 2000:
+                valid_grids[num_valid] = g
+                num_valid += 1
+
+    dx_leaf = (l_xmax - l_xmin) / patch_size[1]
+    dy_leaf = (l_ymax - l_ymin) / patch_size[0]
+
+    for iy in range(patch_size[0]):
+        for ix in range(patch_size[1]):
+            px = l_xmin + (ix + 0.5) * dx_leaf
+            py = l_ymin + (iy + 0.5) * dy_leaf
+
+            best_g = -1
+            best_lvl = -1.0
+
+            for idx in range(num_valid):
+                g = valid_grids[idx]
+                lvl = grid_info[g, 0]
+                if lvl > best_lvl:
+                    g_xmin = grid_info[g, 1]
+                    g_xmax = grid_info[g, 2]
+                    g_ymin = grid_info[g, 3]
+                    g_ymax = grid_info[g, 4]
+
+                    if g_xmin <= px <= g_xmax and g_ymin <= py <= g_ymax:
+                        best_g = g
+                        best_lvl = lvl
+
+            if best_g != -1:
+                g_xmin = grid_info[best_g, 1]
+                g_xmax = grid_info[best_g, 2]
+                g_ymin = grid_info[best_g, 3]
+                g_ymax = grid_info[best_g, 4]
+
+                dx_grid = (g_xmax - g_xmin) / patch_size[1]
+                dy_grid = (g_ymax - g_ymin) / patch_size[0]
+
+                gx = int((px - g_xmin) / dx_grid)
+                gy = int((py - g_ymin) / dy_grid)
+
+                if gx < 0:
+                    gx = 0
+                elif gx > patch_size[1] - 1:
+                    gx = patch_size[1] - 1
+                if gy < 0:
+                    gy = 0
+                elif gy > patch_size[0] - 1:
+                    gy = patch_size[0] - 1
+
+                for c in range(C):
+                    out_values[i, c, iy, ix] = grid_data[best_g, c, gy, gx]
+
+
+@njit(
+    parallel=False,
+    fastmath=True,
+    boundscheck=True,
+    cache=True,
+    nogil=True,
+)
+def _fast_sample_leaves_into(
+    leaf_bounds: np.ndarray,
+    grid_info: np.ndarray,
+    grid_data: np.ndarray,
+    patch_size: tuple[int, int],
+    out_values: np.ndarray,
+) -> None:
+    """Sample leaves serially into a caller-owned output view."""
+    out_values.fill(0)
+    for i in range(leaf_bounds.shape[0]):
+        _fast_sample_one_leaf_into(
+            i, leaf_bounds, grid_info, grid_data, patch_size, out_values
+        )
+
+
+@njit(
+    parallel=False,
+    fastmath=True,
+    boundscheck=True,
+    cache=True,
+    nogil=True,
+)
+def _fast_sample_leaves_raster_into(
+    leaf_bounds: np.ndarray,
+    grid_info: np.ndarray,
+    grid_data: np.ndarray,
+    patch_size: tuple[int, int],
+    out_values: np.ndarray,
+) -> None:
+    """Rasterize source-grid ownership once, then copy all channels."""
+    out_values.fill(0)
+    num_grids = grid_info.shape[0]
+    channels = grid_data.shape[1]
+    for leaf_index in range(leaf_bounds.shape[0]):
+        leaf_xmin = leaf_bounds[leaf_index, 0]
+        leaf_xmax = leaf_bounds[leaf_index, 1]
+        leaf_ymin = leaf_bounds[leaf_index, 2]
+        leaf_ymax = leaf_bounds[leaf_index, 3]
+        dx_leaf = (leaf_xmax - leaf_xmin) / patch_size[1]
+        dy_leaf = (leaf_ymax - leaf_ymin) / patch_size[0]
+
+        valid_grids = np.empty(2000, dtype=np.int32)
+        num_valid = 0
+        for grid_index in range(num_grids):
+            grid_xmin = grid_info[grid_index, 1]
+            grid_xmax = grid_info[grid_index, 2]
+            grid_ymin = grid_info[grid_index, 3]
+            grid_ymax = grid_info[grid_index, 4]
+            if (
+                max(leaf_xmin, grid_xmin) < min(leaf_xmax, grid_xmax)
+                and max(leaf_ymin, grid_ymin) < min(leaf_ymax, grid_ymax)
+                and num_valid < 2000
+            ):
+                valid_grids[num_valid] = grid_index
+                num_valid += 1
+
+        owner = np.full(patch_size, -1, dtype=np.int32)
+        for valid_index in range(num_valid):
+            grid_index = valid_grids[valid_index]
+            level = grid_info[grid_index, 0]
+            grid_xmin = grid_info[grid_index, 1]
+            grid_xmax = grid_info[grid_index, 2]
+            grid_ymin = grid_info[grid_index, 3]
+            grid_ymax = grid_info[grid_index, 4]
+
+            x_first = patch_size[1]
+            x_last = -1
+            for ix in range(patch_size[1]):
+                px = leaf_xmin + (ix + 0.5) * dx_leaf
+                if grid_xmin <= px <= grid_xmax:
+                    if x_first == patch_size[1]:
+                        x_first = ix
+                    x_last = ix
+            y_first = patch_size[0]
+            y_last = -1
+            for iy in range(patch_size[0]):
+                py = leaf_ymin + (iy + 0.5) * dy_leaf
+                if grid_ymin <= py <= grid_ymax:
+                    if y_first == patch_size[0]:
+                        y_first = iy
+                    y_last = iy
+            if x_last < 0 or y_last < 0:
+                continue
+
+            for iy in range(y_first, y_last + 1):
+                for ix in range(x_first, x_last + 1):
+                    previous = owner[iy, ix]
+                    if previous < 0 or level > grid_info[previous, 0]:
+                        owner[iy, ix] = grid_index
+
+        source_x_map = np.zeros(patch_size, dtype=np.int16)
+        source_y_map = np.zeros(patch_size, dtype=np.int16)
+        for iy in range(patch_size[0]):
+            py = leaf_ymin + (iy + 0.5) * dy_leaf
+            for ix in range(patch_size[1]):
+                grid_index = owner[iy, ix]
+                if grid_index < 0:
+                    continue
+                px = leaf_xmin + (ix + 0.5) * dx_leaf
+                grid_xmin = grid_info[grid_index, 1]
+                grid_xmax = grid_info[grid_index, 2]
+                grid_ymin = grid_info[grid_index, 3]
+                grid_ymax = grid_info[grid_index, 4]
+                dx_grid = (grid_xmax - grid_xmin) / patch_size[1]
+                dy_grid = (grid_ymax - grid_ymin) / patch_size[0]
+                source_x = int((px - grid_xmin) / dx_grid)
+                source_y = int((py - grid_ymin) / dy_grid)
+                if source_x < 0:
+                    source_x = 0
+                elif source_x >= patch_size[1]:
+                    source_x = patch_size[1] - 1
+                if source_y < 0:
+                    source_y = 0
+                elif source_y >= patch_size[0]:
+                    source_y = patch_size[0] - 1
+                source_x_map[iy, ix] = source_x
+                source_y_map[iy, ix] = source_y
+
+        for channel in range(channels):
+            for iy in range(patch_size[0]):
+                for ix in range(patch_size[1]):
+                    grid_index = owner[iy, ix]
+                    if grid_index >= 0:
+                        out_values[leaf_index, channel, iy, ix] = grid_data[
+                            grid_index,
+                            channel,
+                            source_y_map[iy, ix],
+                            source_x_map[iy, ix],
+                        ]
+
+
+@njit(
+    parallel=False,
+    fastmath=True,
+    boundscheck=True,
+    cache=True,
+    nogil=True,
+)
 def _fast_sample_leaves(
     leaf_bounds: np.ndarray,
     grid_info: np.ndarray,
     grid_data: np.ndarray,
     patch_size: tuple[int, int],
 ) -> np.ndarray:
-
-    N_leaves = leaf_bounds.shape[0]
-    N_grids = grid_info.shape[0]
-    C = grid_data.shape[1]
-
-    out_values = np.zeros((N_leaves, C, patch_size[0], patch_size[1]), dtype=grid_data.dtype)
-
-    for i in range(N_leaves):
-        l_xmin = leaf_bounds[i, 0]
-        l_xmax = leaf_bounds[i, 1]
-        l_ymin = leaf_bounds[i, 2]
-        l_ymax = leaf_bounds[i, 3]
-
-        # FIX: Increased buffer size significantly
-        valid_grids = np.zeros(2000, dtype=np.int32)
-        num_valid = 0
-
-        for g in range(N_grids):
-            g_xmin = grid_info[g, 1]
-            g_xmax = grid_info[g, 2]
-            g_ymin = grid_info[g, 3]
-            g_ymax = grid_info[g, 4]
-
-            # Intersection test
-            if (max(l_xmin, g_xmin) < min(l_xmax, g_xmax)) and (
-                max(l_ymin, g_ymin) < min(l_ymax, g_ymax)
-            ):
-                # FIX: Explicit bounds safety
-                if num_valid < 2000:
-                    valid_grids[num_valid] = g
-                    num_valid += 1
-
-        dx_leaf = (l_xmax - l_xmin) / patch_size[1]
-        dy_leaf = (l_ymax - l_ymin) / patch_size[0]
-
-        # 2. Narrow-phase: Pixel-by-pixel extraction
-        for iy in range(patch_size[0]):
-            for ix in range(patch_size[1]):
-                px = l_xmin + (ix + 0.5) * dx_leaf
-                py = l_ymin + (iy + 0.5) * dy_leaf
-
-                best_g = -1
-                best_lvl = -1.0
-
-                # Find the highest level_idx grid containing this pixel
-                for idx in range(num_valid):
-                    g = valid_grids[idx]
-                    lvl = grid_info[g, 0]
-                    if lvl > best_lvl:
-                        g_xmin = grid_info[g, 1]
-                        g_xmax = grid_info[g, 2]
-                        g_ymin = grid_info[g, 3]
-                        g_ymax = grid_info[g, 4]
-
-                        if g_xmin <= px <= g_xmax and g_ymin <= py <= g_ymax:
-                            best_g = g
-                            best_lvl = lvl
-
-                # 3. Extract data from the winning grid
-                if best_g != -1:
-                    g_xmin = grid_info[best_g, 1]
-                    g_xmax = grid_info[best_g, 2]
-                    g_ymin = grid_info[best_g, 3]
-                    g_ymax = grid_info[best_g, 4]
-
-                    dx_grid = (g_xmax - g_xmin) / patch_size[1]
-                    dy_grid = (g_ymax - g_ymin) / patch_size[0]
-
-                    gx = int((px - g_xmin) / dx_grid)
-                    gy = int((py - g_ymin) / dy_grid)
-
-                    # Clamp indices safely
-                    if gx < 0:
-                        gx = 0
-                    elif gx > patch_size[1] - 1:
-                        gx = patch_size[1] - 1
-                    if gy < 0:
-                        gy = 0
-                    elif gy > patch_size[0] - 1:
-                        gy = patch_size[0] - 1
-
-                    for c in range(C):
-                        out_values[i, c, iy, ix] = grid_data[best_g, c, gy, gx]
-
+    """Compatibility allocator around :func:`_fast_sample_leaves_into`."""
+    out_values = np.empty(
+        (
+            leaf_bounds.shape[0],
+            grid_data.shape[1],
+            patch_size[0],
+            patch_size[1],
+        ),
+        dtype=grid_data.dtype,
+    )
+    _fast_sample_leaves_into(
+        leaf_bounds, grid_info, grid_data, patch_size, out_values
+    )
     return out_values
 
 
@@ -562,8 +801,120 @@ def amrex_to_quadtree(
     return qt, grid_data, grid_info
 
 
+def sample_amrex_decoded_into(
+    leaf_bounds: np.ndarray,
+    qt_xmax: float,
+    qt_ymax: float,
+    grid_info_phys: np.ndarray,
+    grid_data: np.ndarray,
+    domain_lo: np.ndarray,
+    domain_hi: np.ndarray,
+    output: np.ndarray,
+    patch_size: int | tuple[int, int] = 32,
+    profile: dict[str, float] | None = None,
+    raster_sampler: bool = False,
+) -> None:
+    """Sample one decoded frame into a writable ``(N,C,H,W)`` output view."""
+    if isinstance(patch_size, int):
+        patch_size = (patch_size, patch_size)
+    expected_shape = (
+        leaf_bounds.shape[0],
+        grid_data.shape[1],
+        patch_size[0],
+        patch_size[1],
+    )
+    if output.shape != expected_shape:
+        raise ValueError(
+            f"Direct AMReX output has shape {output.shape}; expected {expected_shape}."
+        )
+    if output.dtype != grid_data.dtype:
+        raise ValueError(
+            f"Direct AMReX output dtype {output.dtype} does not match "
+            f"decoded dtype {grid_data.dtype}."
+        )
+    if not output.flags.writeable:
+        raise ValueError("Direct AMReX output must be writable.")
+
+    index_started = time.perf_counter() if profile is not None else None
+    grid_info = _phys_to_idx(
+        grid_info_phys, domain_lo, domain_hi, qt_xmax, qt_ymax
+    )
+    if profile is not None:
+        profile["amrex_grid_index_s"] = profile.get(
+            "amrex_grid_index_s", 0.0
+        ) + (time.perf_counter() - index_started)
+
+    sample_started = time.perf_counter() if profile is not None else None
+    sampler = (
+        _fast_sample_leaves_raster_into
+        if raster_sampler
+        else _fast_sample_leaves_into
+    )
+    sampler(leaf_bounds, grid_info, grid_data, patch_size, output)
+    if profile is not None:
+        profile["amrex_sample_s"] = profile.get("amrex_sample_s", 0.0) + (
+            time.perf_counter() - sample_started
+        )
+
+
+def assign_from_amrex_decoded(
+    qt: Quadtree,
+    grid_info_phys: np.ndarray,
+    grid_data: np.ndarray,
+    domain_lo: np.ndarray,
+    domain_hi: np.ndarray,
+    patch_size: int | tuple[int, int] = 32,
+    profile: dict[str, float] | None = None,
+) -> None:
+    """Sample one already-decoded AMReX frame onto an existing quadtree."""
+    if isinstance(patch_size, int):
+        patch_size = (patch_size, patch_size)
+
+    leaves = list(qt._iter_all_leaves())
+    leaf_bounds = np.zeros((len(leaves), 4), dtype=np.float64)
+    for i, leaf in enumerate(leaves):
+        leaf_bounds[i, 0] = leaf.cx - leaf.hx
+        leaf_bounds[i, 1] = leaf.cx + leaf.hx
+        leaf_bounds[i, 2] = leaf.cy - leaf.hy
+        leaf_bounds[i, 3] = leaf.cy + leaf.hy
+
+    out_values = np.empty(
+        (
+            len(leaves),
+            grid_data.shape[1],
+            patch_size[0],
+            patch_size[1],
+        ),
+        dtype=grid_data.dtype,
+    )
+    sample_amrex_decoded_into(
+        leaf_bounds,
+        qt.xmax,
+        qt.ymax,
+        grid_info_phys,
+        grid_data,
+        domain_lo,
+        domain_hi,
+        out_values,
+        patch_size,
+        profile,
+    )
+
+    install_started = time.perf_counter() if profile is not None else None
+    for i, leaf in enumerate(leaves):
+        leaf.value = out_values[i].astype(np.float32)
+    if profile is not None:
+        profile["amrex_leaf_install_s"] = profile.get(
+            "amrex_leaf_install_s", 0.0
+        ) + (time.perf_counter() - install_started)
+
+
 def assign_from_amrex(
-    qt: Quadtree, ds_or_path, field_names: list[str], patch_size: int | tuple[int, int] = 32
+    qt: Quadtree,
+    ds_or_path,
+    field_names: list[str],
+    patch_size: int | tuple[int, int] = 32,
+    profile: dict[str, float] | None = None,
 ) -> None:
     """
     Populates an existing Quadtree's leaves using AMReX data via Numba sampling.
@@ -574,9 +925,14 @@ def assign_from_amrex(
 
     if isinstance(ds_or_path, str):
         # --- Fast path: direct binary read ---
+        read_started = time.perf_counter() if profile is not None else None
         grid_info_phys, grid_data, header_info = read_plotfile_raw(
             ds_or_path, field_names, patch_size
         )
+        if profile is not None:
+            profile["amrex_read_s"] = profile.get("amrex_read_s", 0.0) + (
+                time.perf_counter() - read_started
+            )
         domain_lo = header_info["domain_lo"]
         domain_hi = header_info["domain_hi"]
     else:
@@ -600,21 +956,12 @@ def assign_from_amrex(
                 grid_data[i, c, :, :] = arr
             grid.clear_data()
 
-    # Convert physical → index coords
-    xmax_idx = qt.xmax
-    ymax_idx = qt.ymax
-    grid_info = _phys_to_idx(grid_info_phys, domain_lo, domain_hi, xmax_idx, ymax_idx)
-
-    # --- Prep Leaves & Run Numba Sampler ---
-    leaves = list(qt._iter_all_leaves())
-    leaf_bounds = np.zeros((len(leaves), 4), dtype=np.float64)
-    for i, leaf in enumerate(leaves):
-        leaf_bounds[i, 0] = leaf.cx - leaf.hx
-        leaf_bounds[i, 1] = leaf.cx + leaf.hx
-        leaf_bounds[i, 2] = leaf.cy - leaf.hy
-        leaf_bounds[i, 3] = leaf.cy + leaf.hy
-
-    out_values = _fast_sample_leaves(leaf_bounds, grid_info, grid_data, patch_size)
-
-    for i, leaf in enumerate(leaves):
-        leaf.value = out_values[i].astype(np.float32)
+    assign_from_amrex_decoded(
+        qt,
+        grid_info_phys,
+        grid_data,
+        domain_lo,
+        domain_hi,
+        patch_size,
+        profile,
+    )

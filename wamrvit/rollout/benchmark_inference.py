@@ -11,12 +11,11 @@ No metric computation, no GT loading beyond what the loader emits incidentally,
 no Ray, no DDP. Single-GPU, single-process.
 
 Usage:
-    uv run wamrvit/rollout/benchmark_inference.py \\
-        +experiment=benchmark_inference \\
-        dataset=pli_adaptive \\
-        inference.checkpoint_path="/path/to/some_run/model" \\
-        benchmark.output_path="results/benchmark_inference/pli_adaptive_uniform.json" \\
-        benchmark.variant_tag=adaptive_uniform
+    uv run --no-sync wamrvit/rollout/benchmark_inference.py \\
+        +experiment=rollout_pli_adaptive \\
+        inference.checkpoint_path="checkpoints/some_run/model" \\
+        +benchmark.output_path="results/benchmark_inference/pli_adaptive_uniform.json" \\
+        +benchmark.variant_tag=adaptive_uniform
 """
 
 import argparse
@@ -36,17 +35,17 @@ import numpy as np
 import torch
 from numba import get_num_threads
 
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.native_train_utils import unpack_native_batch
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.dataloader.payload.transforms import transform_regrid_values
+from wamrvit.multi_scale import unpack_multi_scale_batch
 from wamrvit.quad.adapt_wavelet import regrid
 from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
-from wamrvit.quad.quad_utils import quadtree_to_tensor, tensor_to_quadtree
+from wamrvit.quad.quad_utils import make_regular_centers, quadtree_to_tensor, tensor_to_quadtree
 from wamrvit.quad.regrid_dispatch import (
     regrid_native_dispatch,
     regrid_uniform_sequence_dispatch,
 )
-from wamrvit.quad.yt_utils import make_regular_centers
-from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
 
 
@@ -123,7 +122,7 @@ def _canonical_topology_arrays(meta: dict[str, Any]) -> tuple[np.ndarray, np.nda
         return np.asarray(meta["tiles"]), np.asarray(meta["xy_idx"])
     # Loader metadata predates the array export fields. Use the same importer as
     # the regrid engine so fixture identity cannot drift from runtime geometry.
-    from wamrvit.quad.array_regrid_geometry import _import_topology_metadata
+    from wamrvit.quad.array_regrid.core import _import_topology_metadata
 
     top = _import_topology_metadata(
         len(meta["levels"]), meta, meta.get("cell_scale_mode", "level_idx")
@@ -191,43 +190,13 @@ def _detect_variant(model, ckpt_path: str) -> str:
     )
 
 
-def _load_model(inf_cfg: dict, model_cfg: dict):
-    """Auto-detect SwinV2 vs QuadTreeTransformer from the checkpoint's config.json,
-    mirroring rollout_regular.py:28-44."""
-    ckpt_path = inf_cfg["checkpoint_path"]
-    is_diffusers = inf_cfg.get("is_diffusers", True)
-    cls_name = model_cfg.get("_class_name", "QuadTreeTransformer")
-    if is_diffusers:
-        ckpt_config_path = os.path.join(ckpt_path, "config.json")
-        if os.path.exists(ckpt_config_path):
-            with open(ckpt_config_path) as f:
-                cls_name = json.load(f).get("_class_name", cls_name)
-    if cls_name == "SwinV2Transformer":
-        from wamrvit.swin_transformer import SwinV2Transformer
-
-        model_cls = SwinV2Transformer
-    else:
-        model_cls = QuadTreeTransformer
-    if is_diffusers:
-        print(f"Loading {cls_name} via diffusers from: {ckpt_path}")
-        model = model_cls.from_pretrained(ckpt_path)
-    else:
-        print(f"Loading {cls_name} state dict from: {ckpt_path}")
-        model = model_cls(**model_cfg)
-        sd = torch.load(ckpt_path, map_location="cpu")
-        if "module." in list(sd.keys())[0]:
-            sd = {k.replace("module.", ""): v for k, v in sd.items()}
-        model.load_state_dict(sd)
-    return model
-
-
 class BenchmarkRunner:
     def __init__(self, config: dict):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         inf_cfg = config["inference"]
-        self.model = _load_model(inf_cfg, config["model"])
+        self.model = load_model(inf_cfg["checkpoint_path"], config["model"])
         self.model.to(self.device).eval()
         self.variant = _detect_variant(self.model, inf_cfg["checkpoint_path"])
         self.transform = instantiate_from_config(config["transform"])
@@ -318,7 +287,7 @@ class BenchmarkRunner:
     # ------------------------------------------------------------------
 
     def _build_test_windows(self) -> list[dict[str, Any]]:
-        """Replicate rollout_adaptive.py:874-888 windowing + split."""
+        """Keep the historical timing cohort; this is not held-out accuracy selection."""
         cfg = self.config
         file_parser = instantiate_from_config(cfg["file_parser"])
         all_paths = file_parser(cfg["data"]["glob_pattern"])
@@ -329,7 +298,8 @@ class BenchmarkRunner:
         wg_cfg["params"] = dict(wg_cfg.get("params", {}))
         wg_cfg["params"]["file_path_list"] = all_paths
         windows = instantiate_from_config(wg_cfg)
-        split_ratio = float(cfg["inference"].get("split_ratio", 0.8))
+        default_ratio = 0.0 if cfg["inference"].get("split_policy") == "prepartitioned" else 0.8
+        split_ratio = float(cfg["inference"].get("split_ratio", default_ratio))
         split_idx = int(len(windows) * split_ratio)
         return windows[split_idx:]
 
@@ -426,7 +396,7 @@ class BenchmarkRunner:
             return {"input": inp, "centers": centers, "meta": meta}
 
         # adaptive_native: per-level columns + leaf_to_bucket + centers.
-        inputs_by_level, _, leaf_to_bucket, centers = unpack_native_batch(
+        inputs_by_level, _, leaf_to_bucket, centers = unpack_multi_scale_batch(
             mapped,
             self.num_levels,
             self.device,
@@ -555,17 +525,20 @@ class BenchmarkRunner:
                     with _timed(regrid_block):
                         with _timed(rg_substeps["d2h"], sync_cuda=True):
                             N, c_in, t_in, h, w = inputs.shape
+                            regrid_input = transform_regrid_values(
+                                self.transform, inputs, inverse=True
+                            )
                             if self.regrid_backend == "array":
                                 sequence_input = (
-                                    inputs
+                                    regrid_input
                                     if getattr(
                                         self, "array_regrid_payload_backend", "cpu_eager"
                                     ) == "gpu_replay"
-                                    else inputs.detach().cpu().numpy()
+                                    else regrid_input.detach().cpu().numpy()
                                 )
                             else:
                                 flat_input = (
-                                    inputs.transpose(1, 2)
+                                    regrid_input.transpose(1, 2)
                                     .contiguous()
                                     .view(N, t_in * c_in, h, w)
                                     .cpu()
@@ -653,6 +626,11 @@ class BenchmarkRunner:
                                     new_input_np.reshape(new_N, t_in, c_in, h, w)
                                     .transpose(0, 2, 1, 3, 4))
                         with _timed(rg_substeps["h2d"], sync_cuda=True):
+                            # Artifact payloads retain the physical-space regrid result;
+                            # only the next model input is converted back to model space.
+                            new_sequence_np = transform_regrid_values(
+                                self.transform, new_sequence_np, inverse=False
+                            )
                             centers = torch.from_numpy(meta["centers"]).to(
                                 self.device, dtype=torch.float32
                             )
@@ -761,7 +739,10 @@ class BenchmarkRunner:
                 break
 
         with _timed(rg_substeps["d2h"], sync_cuda=True):
-            np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
+            original_by_level = transform_regrid_values(
+                self.transform, curr_by_level, inverse=True
+            )
+            np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in original_by_level.items()}
             l2b_np = leaf_to_bucket.cpu().numpy()
 
         if self.regrid_backend == "array":
@@ -835,6 +816,9 @@ class BenchmarkRunner:
                     )
 
         with _timed(rg_substeps["h2d"], sync_cuda=True):
+            new_by_level_np = transform_regrid_values(
+                self.transform, new_by_level_np, inverse=False
+            )
             new_by_level = {
                 lvl: torch.from_numpy(arr).to(self.device, dtype=torch.float32)
                 for lvl, arr in new_by_level_np.items()

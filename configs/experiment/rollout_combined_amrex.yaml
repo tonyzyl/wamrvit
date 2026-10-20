@@ -1,0 +1,26 @@
+# @package _global_
+# AMReX uniform-adaptive versus canonical p32/level-2 regular ViT or revised Swin.
+# Regular checkpoints must use the manuscript's p32/level-2 geometry.
+defaults:
+  - override /dataset: amrex_adaptive
+  - override /mode: rollout_amrex
+
+file_loader:
+  params:
+    return_src: True
+
+inference:
+  # Override env memory defaults; allocate 200 GiB host RAM (Slurm --mem=200G).
+  # The 150-GiB object store is included in that allocation.
+  ray_object_store_memory: 150
+  checkpoint_path_adaptive: ${checkpoint_root}/amrex_adaptive/model
+  checkpoint_path_regular: ${checkpoint_root}/amrex_regular_p32/model
+  regular_target_level: 2
+  regrid_backend: array
+  array_regrid_value_storage: source
+  array_regrid_payload_backend: gpu_replay
+  array_regrid_capacity: 8192
+  # Existing capacity/unsupported-operation object fallback is unchanged.
+  num_gpus_adaptive: 1
+  num_gpus_regular: 1
+  output_csv: ${output_root}/rmse_combined_amrex.csv

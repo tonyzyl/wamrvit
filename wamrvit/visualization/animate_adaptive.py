@@ -9,9 +9,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.array_regrid_runtime import configure_array_regrid_num_threads
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.dataloader.payload.transforms import transform_regrid_values
+from wamrvit.multi_scale import unpack_multi_scale_batch
+from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
 from wamrvit.quad.regrid_dispatch import (
     regrid_native_dispatch,
     regrid_uniform_dispatch,
@@ -23,7 +25,6 @@ from wamrvit.quad.quad_utils import (
     tensor_to_uniform,
     tensor_to_uniform_native,
 )
-from wamrvit.quadtree_transformer import QuadTreeTransformer
 from wamrvit.utils import instantiate_from_config, load_config
 from wamrvit.visualization import anim_style
 from wamrvit.visualization.plotting import compute_vrange, plot_quadtree
@@ -388,7 +389,7 @@ def _animate_native(
     def _unpack(arr):
         return arr[0] if arr.dtype == object else arr
 
-    inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_native_batch(
+    inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_multi_scale_batch(
         batch,
         num_levels,
         device,
@@ -453,7 +454,10 @@ def _animate_native(
                         C_orig, T_orig = arr.shape[1], arr.shape[2]
                         break
                 n_leaves_before = int(leaf_to_bucket.shape[0])
-                np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
+                original_by_level = transform_regrid_values(
+                    transform, curr_by_level, inverse=True
+                )
+                np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in original_by_level.items()}
                 new_np, new_l2b, meta = regrid_native_dispatch(
                     np_by_level,
                     leaf_to_bucket.cpu().numpy(),
@@ -467,6 +471,7 @@ def _animate_native(
                     adapt_nearby=regrid_adapt_nearby,
                     allow_coarsening=allow_coarsening,
                 )
+                new_np = transform_regrid_values(transform, new_np, inverse=False)
                 curr_by_level = {
                     lvl: torch.from_numpy(arr).to(device, dtype=torch.float32)
                     for lvl, arr in new_np.items()
@@ -994,14 +999,7 @@ def main():
 
     # --- 4. LOAD MODEL ---
     inf_cfg = config["inference"]
-    if inf_cfg.get("is_diffusers", False):
-        model = QuadTreeTransformer.from_pretrained(inf_cfg["checkpoint_path"])
-    else:
-        model = QuadTreeTransformer(**config["model"])
-        state_dict = torch.load(inf_cfg["checkpoint_path"], map_location="cpu")
-        if "module." in list(state_dict.keys())[0]:
-            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
+    model = load_model(inf_cfg["checkpoint_path"], config["model"])
 
     multi_scale = getattr(model.config, "multi_scale_patch", False)
     num_levels = int(model.config.max_level_idx) + 1 if multi_scale else 0
@@ -1128,6 +1126,9 @@ def main():
                 and timestep_idx % regrid_interval == 0
             ):
                 N, c_in, t_in, h, w = curr_input_seq.shape
+                regrid_input = transform_regrid_values(
+                    transform, curr_input_seq, inverse=True
+                )
                 ch_offset = (t_in - 1) * c_in
                 use_channels = (
                     [ch + ch_offset for ch in adapt_on_channels]
@@ -1137,9 +1138,9 @@ def main():
 
                 if regrid_backend == "array":
                     sequence_input = (
-                        curr_input_seq
+                        regrid_input
                         if array_payload_backend == "gpu_replay"
-                        else curr_input_seq.detach().cpu().numpy()
+                        else regrid_input.detach().cpu().numpy()
                     )
                     new_sequence, meta = regrid_uniform_sequence_dispatch(
                         sequence_input,
@@ -1159,7 +1160,7 @@ def main():
                     )
                 else:
                     flat_input = (
-                        curr_input_seq.transpose(1, 2)
+                        regrid_input.transpose(1, 2)
                         .contiguous()
                         .view(N, t_in * c_in, h, w)
                         .cpu()
@@ -1182,6 +1183,7 @@ def main():
                             0, 2, 1, 3, 4
                         )
                     )
+                new_sequence = transform_regrid_values(transform, new_sequence, inverse=False)
                 centers = torch.from_numpy(meta["centers"]).to(device, dtype=torch.float32)
 
                 new_N = new_sequence.shape[0]

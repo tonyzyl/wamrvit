@@ -1,11 +1,56 @@
-# -----------------------------------------------------------------------------
-# Attribution:
-# This code is adapted from the benchmark metrics of "The Well" dataset
-# developed by Polymathic AI.
-# Original repository: https://github.com/PolymathicAI/the_well
-# -----------------------------------------------------------------------------
+# Benchmark metrics adapted from The Well, developed by Polymathic AI.
+# Source: https://github.com/PolymathicAI/the_well/blob/v1.2.0/the_well/benchmark/metrics/spatial.py
+# The following BSD-3-Clause notice applies to the upstream-derived portions.
+#
+# BSD 3-Clause License
+#
+# Copyright (c) 2024 Polymathic AI.
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+#
+# 3. Neither the name of Polymathic AI nor the names of the Well contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import numpy as np
 import torch
+
+
+def normalize_numeric_result_columns(df):
+    """Normalize scalar/singleton numeric Ray result cells to a float DataFrame.
+
+    Supported sparse metrics can arrive as one-element ndarrays in object
+    columns. Preserve None/NaN as missing support, and reject malformed cells
+    instead of silently dropping columns or filling unsupported levels.
+    """
+    import pandas as pd
+
+    numeric_columns = {}
+    for column in df.columns:
+        values = []
+        for value in df[column]:
+            if value is None:
+                values.append(np.nan)
+                continue
+            array = np.asarray(value)
+            if array.size != 1 or array.dtype.kind not in "biuf":
+                raise TypeError(
+                    f"Nonnumeric rollout metric value in {column}: "
+                    f"shape={array.shape}, dtype={array.dtype}"
+                )
+            values.append(float(array.reshape(-1)[0]))
+        numeric_columns[column] = values
+    return pd.DataFrame(numeric_columns, index=df.index, dtype=float)
+
+
+def mean_numeric_result_columns(df):
+    """Average each result column over supported windows; all-missing stays NaN."""
+    return normalize_numeric_result_columns(df).mean(skipna=True)
 
 
 class PearsonR:

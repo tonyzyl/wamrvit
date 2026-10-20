@@ -1,0 +1,22 @@
+# @package _global_
+# Raw PLI native Conv3D, multi-scale cascade, level AdaLN and full-field L2 loss.
+# Adapted from the existing native recipe; topology caching is CLI opt-in.
+defaults:
+  - override /dataset: pli_adaptive
+  - override /mode: train
+
+model:
+  multi_scale_patch: True
+  multi_scale_channel_mult: 2
+  level_conditioned_norm: True
+
+file_loader:
+  params:
+    value_storage: native
+
+train:
+  loss_mode: full_field
+  num_push_forward_steps: 1
+
+general:
+  run_name: pli_native_fullfield

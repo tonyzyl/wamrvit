@@ -1,0 +1,8 @@
+# @package _global_
+# Raw PLI regular ViT/Conv3D, finest patch [10, 5], fixed PF1.
+defaults:
+  - override /dataset: pli_regular
+  - override /mode: train
+
+general:
+  run_name: pli_regular

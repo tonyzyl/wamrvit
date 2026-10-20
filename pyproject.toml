@@ -1,8 +1,10 @@
 [project]
 name = "wamrvit"
 version = "0.1.0"
-description = "Analysis and Visualization of Trajectory Data"
+description = "Wavelet-adaptive vision transformers for scientific spatiotemporal forecasting"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "accelerate",
@@ -30,3 +32,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wamrvit"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP"]
+
+[tool.ruff.format]

@@ -1,0 +1,17 @@
+# @package _global_
+# Revised TRL Swin, finest patch [4, 4], explicit train/valid sources.
+defaults:
+  - override /dataset: trl_regular_swin
+  - override /mode: train
+
+optimizer:
+  weight_decay: 5e-2
+
+train:
+  split_ratio: 1.0
+  num_train_epochs: 200
+  save_every_epochs: 100
+  num_push_forward_steps: 1
+
+general:
+  run_name: trl_swin

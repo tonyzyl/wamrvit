@@ -1,0 +1,12 @@
+# @package _global_
+# AMReX uniform-adaptive PF4 evaluation with source-backed GPU payload replay.
+defaults:
+  - override /dataset: amrex_adaptive
+  - override /mode: rollout_amrex
+
+inference:
+  # Override env memory defaults; allocate 200 GiB host RAM (Slurm --mem=200G).
+  # The 150-GiB object store is included in that allocation.
+  ray_object_store_memory: 150
+  checkpoint_path: ${checkpoint_root}/amrex_adaptive/model
+  output_csv: ${output_root}/rmse_amrex_adaptive.csv

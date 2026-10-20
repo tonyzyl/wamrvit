@@ -1,0 +1,8 @@
+# @package _global_
+# Revised PLI Swin, finest patch [10, 5], fixed PF1.
+defaults:
+  - override /dataset: pli_regular_swin
+  - override /mode: train
+
+general:
+  run_name: pli_swin

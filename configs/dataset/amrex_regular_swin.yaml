@@ -1,0 +1,4 @@
+# @package _global_
+# Canonical revised AMReX Swin: p32 on simulation level 2 (1024 x 6144).
+defaults:
+  - amrex_regular_swin_p32

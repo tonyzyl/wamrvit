@@ -1,0 +1,51 @@
+# @package _global_
+# Shared AMReX fields, native clock and combustion normalization.
+
+fields:
+  all:
+    - HRR
+    - T
+    - mach
+    - pressure
+    - rho
+    - rhoE
+    - rhoUx
+    - rhoUy
+    - rhoY_H
+    - rhoY_H2
+    - rhoY_H2O
+    - rhoY_H2O2
+    - rhoY_HO2
+    - rhoY_N2
+    - rhoY_O
+    - rhoY_O2
+    - rhoY_OH
+
+file_parser:
+  target: wamrvit.dataloader.selection.sources.single_traj_parser
+
+window_generator:
+  target: wamrvit.dataloader.selection.windows.generate_ar_windows
+  params:
+    input_seq_len: 2
+    return_seq_len: 1
+    sampling_interval: 1
+    interval_between_pred: 1
+
+transform:
+  target: wamrvit.dataloader.payload.transforms.NormalizeArray
+  params:
+    channel_dim: -4
+    norm_json_path: wamrvit/static/combustion_normalization.json
+    field_names: ${fields.all}
+
+# Cache identity only; topology caching remains CLI opt-in.
+topology_store:
+  source_root: ${data_root}/stratified_detonation/uni_stoich/plt
+  dataset_id: amrex
+
+data:
+  time:
+    source: native
+  glob_pattern: ${data_paths.amrex}
+  field_names: ${fields.all}

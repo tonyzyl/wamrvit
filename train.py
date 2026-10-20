@@ -1,33 +1,57 @@
 from __future__ import annotations
 
 import argparse
-import os
 import math
+import os
 import random
-import warnings
 import tempfile
-import numpy as np
-import torch
+import warnings
 from typing import Dict
 
+import numpy as np
 import ray
-from ray import train
-from ray.train import Checkpoint, ScalingConfig, RunConfig, CheckpointConfig, FailureConfig
-from ray.train.torch import TorchConfig, TorchTrainer, prepare_model
-
-from diffusers.utils import is_wandb_available
+import torch
 from diffusers.training_utils import EMAModel
-
-from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.utils import is_main_process, instantiate_from_config, get_scheduler_with_min_lr, UniformLossMaskScheduler, load_config, apply_two_stage_topology_pipeline, resolve_effective_config, get_git_info
-
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.quad.yt_utils import make_regular_centers
-from wamrvit.native_train_utils import (
-    unpack_native_batch, multi_scale_loss, residual_targets,
-    UniformGeometry, full_field_loss, advance_window,
+from diffusers.utils import is_wandb_available
+from ray import train
+from ray.train import (
+    Checkpoint,
+    CheckpointConfig,
+    FailureConfig,
+    RunConfig,
+    ScalingConfig,
 )
+from ray.train.torch import TorchTrainer, prepare_model
 
+from wamrvit.dataloader.transport.runtime import (
+    TrainingBatchSource,
+    configure_payload_transport,
+    materialize_with_capacity,
+    prepare_source_provider,
+    validate_source_provider,
+)
+from wamrvit.dataloader.sequence import advance_window
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.dataloader.pipeline import apply_two_stage_topology_pipeline
+from wamrvit.loss import UniformLossMaskScheduler, full_field_loss, multi_scale_loss
+from wamrvit.multi_scale import UniformGeometry, prepare_multi_scale_batch, residual_targets
+from wamrvit.optim import (
+    GradientAccumulator,
+    build_lr_scheduler,
+    build_optimizer,
+    describe_optimizer,
+    optimizer_updates_per_epoch,
+    positive_int,
+)
+from wamrvit.quad.quad_utils import make_regular_centers
+from wamrvit.quadtree_transformer import QuadTreeTransformer
+from wamrvit.utils import (
+    get_git_info,
+    instantiate_from_config,
+    is_main_process,
+    load_config,
+    resolve_effective_config,
+)
 
 if is_wandb_available():
     import wandb
@@ -39,7 +63,7 @@ def train_func(config_dict: Dict):
     train_config = config_dict["train"]
     loss_fn_config = config_dict["loss_fn"]
     data_config = config_dict["data"]
-    model_config = config_dict["model"]
+    model_config = dict(config_dict["model"])
     optimizer_config = config_dict["optimizer"]
     lr_scheduler_config = config_dict["lr_scheduler"]
     ema_config = config_dict.get("ema", {"use_ema": False})
@@ -63,8 +87,8 @@ def train_func(config_dict: Dict):
     else:
         model_cls = QuadTreeTransformer
     model = model_cls(**model_config)
-
-    # Native batches can leave per-level branches unused on individual ranks.
+    # Prepare model for DDP. Swin disables buffer sync; native level buckets
+    # may leave some encoder/output branches unused.
     parallel_strategy_kwargs = (
         {"broadcast_buffers": False} if model_class_name == "SwinV2Transformer" else {}
     )
@@ -75,42 +99,56 @@ def train_func(config_dict: Dict):
     if rank == 0:
         print(f"Model Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), **optimizer_config)
+    optimizer = build_optimizer(model, optimizer_config)
+    if rank == 0:
+        print(describe_optimizer(optimizer))
     loss_fn = instantiate_from_config(loss_fn_config)
 
-    # 4. Resolve Epoch vs Step based training
-    global_batch_size = train_config["batch_size"] * train_config["num_gpus"]
-    grad_accum_steps = train_config.get("grad_accum_steps", 1)
-    num_update_steps_per_epoch = math.ceil(data_config["num_train_samples"] / global_batch_size / grad_accum_steps)
+    # 4. Resolve epoch vs. optimizer-step based training. Ray's equal shard
+    # split drops the global remainder, so derive the scheduler horizon from
+    # the batches each rank actually consumes rather than the global ceiling.
+    batch_size = positive_int(train_config, "batch_size", 1)
+    world_size = positive_int(train_config, "num_gpus", 1)
+    grad_accum_steps = positive_int(train_config, "grad_accum_steps", 1)
+    num_update_steps_per_epoch = optimizer_updates_per_epoch(
+        num_samples=int(data_config["num_train_samples"]),
+        world_size=world_size,
+        batch_size=batch_size,
+        grad_accum_steps=grad_accum_steps,
+    )
+    if rank == 0:
+        print(
+            "Gradient accumulation: "
+            f"steps={grad_accum_steps}, optimizer_updates_per_epoch="
+            f"{num_update_steps_per_epoch}"
+        )
 
     is_step_based = "num_train_steps" in train_config
     if is_step_based:
-        assert "num_train_epochs" not in train_config, "Cannot specify both 'num_train_steps' and 'num_train_epochs' in the config."
+        if "num_train_epochs" in train_config:
+            raise ValueError(
+                "Cannot specify both 'num_train_steps' and 'num_train_epochs' in the config."
+            )
         max_train_steps = train_config["num_train_steps"]
         max_epochs = float('inf')
         save_freq = train_config.get("save_every_steps")
     else:
-        assert "num_train_epochs" in train_config, "Must specify either 'num_train_steps' or 'num_train_epochs'."
+        if "num_train_epochs" not in train_config:
+            raise ValueError("Must specify either 'num_train_steps' or 'num_train_epochs'.")
         max_epochs = train_config["num_train_epochs"]
         max_train_steps = max_epochs * num_update_steps_per_epoch
         save_freq = train_config.get("save_every_epochs")
 
     # LR Scheduler
-    lr_scheduler = None
-    if lr_scheduler_config and lr_scheduler_config.get("name"):
-        lr_scheduler = get_scheduler_with_min_lr(
-            name=lr_scheduler_config["name"],
-            optimizer=optimizer,
-            base_lr=optimizer_config["lr"],
-            min_lr=lr_scheduler_config.get("min_lr", 0.0),
-            num_warmup_steps=lr_scheduler_config["num_warmup_steps"],
-            num_training_steps=max_train_steps,
-            num_cycles=lr_scheduler_config.get("num_cycles", 1),
-            power=lr_scheduler_config.get("power", 1.0),
-        )
+    lr_scheduler = build_lr_scheduler(
+        optimizer,
+        lr_scheduler_config,
+        num_training_steps=max_train_steps,
+    )
 
     if loss_mask_scheduler_config is not None:
-        assert model_config["adaptive"], "Loss Mask Scheduler is only applicable for adaptive models."
+        if not model_config["adaptive"]:
+            raise ValueError("Loss Mask Scheduler is only applicable for adaptive models.")
         loss_mask_scheduler = UniformLossMaskScheduler(
             min_keep_ratio=loss_mask_scheduler_config.get("min_keep_ratio", 0.1),
             max_step_ratio=loss_mask_scheduler_config.get("max_step_ratio", 0.8),
@@ -195,27 +233,33 @@ def train_func(config_dict: Dict):
     wandb_enabled = config_dict["args"]["wandb"]
     if wandb_enabled and is_main_process() and is_wandb_available():
         effective_config = resolve_effective_config(config_dict)
+        effective_config.pop("__source_fill_params__", None)
+        effective_config.pop("__cache_topology_pipeline__", None)
         effective_config["git"] = get_git_info()
         wandb.init(
             project="wamrvit",
             config=effective_config,
-            name=general_config.get("run_name", "amrex_run"),
+            name=general_config.get("run_name", "train_run"),
             reinit=True,
         )
 
-    # 8. Data Shards
+    # 8. Rank-owned data shard. Ray owns shuffle and equal splitting.
     ds_train = train.get_dataset_shard("train")
+    if ds_train is None:
+        raise RuntimeError(f"Rank {rank} did not receive the training dataset.")
+    batch_source = TrainingBatchSource(config_dict, ds_train, rank=rank)
 
     num_push_forward_steps = train_config.get("num_push_forward_steps", 1)
-    pin_memory = train_config.get("pin_memory", False)
+    pin_memory = batch_source.pin_memory
 
     # Multi-scale native-storage path
     multi_scale = bool(model_config.get("multi_scale_patch", False))
     if multi_scale:
-        assert model_config.get("adaptive", True), "multi_scale_patch requires adaptive=True."
+        if not model_config.get("adaptive", True):
+            raise ValueError("multi_scale_patch requires adaptive=True.")
         file_loader_params = config_dict.get("file_loader", {}).get("params", {})
-        assert file_loader_params.get("value_storage", "uniform") == "native", \
-               "multi_scale_patch requires file_loader.value_storage='native'."
+        if file_loader_params.get("value_storage", "uniform") != "native":
+            raise ValueError("multi_scale_patch requires file_loader.value_storage='native'.")
     num_levels_native = int(model_config.get("max_level_idx", 2)) + 1 if multi_scale else 0
 
     # Native-mode loss mode. 
@@ -265,6 +309,35 @@ def train_func(config_dict: Dict):
         else:
             train.report(current_metrics)
 
+    accumulator = GradientAccumulator(
+        model,
+        optimizer,
+        steps=grad_accum_steps,
+        lr_scheduler=lr_scheduler,
+        ema_model=ema_model,
+    )
+    latest_train_loss: torch.Tensor | None = None
+
+    def record_optimizer_update(
+        mean_loss: torch.Tensor,
+        *,
+        active_grid_ratio: float | None = None,
+    ) -> None:
+        nonlocal global_step, latest_train_loss
+        global_step += 1
+        latest_train_loss = mean_loss
+        if wandb_enabled and is_main_process() and is_wandb_available():
+            logs = {
+                "train/loss": float(mean_loss.item()),
+                "epoch": epoch,
+                "step": global_step,
+            }
+            if lr_scheduler:
+                logs["train/lr"] = lr_scheduler.get_last_lr()[0]
+            if active_grid_ratio is not None:
+                logs["train/active_grid_ratio"] = active_grid_ratio
+            wandb.log(logs, step=global_step)
+
     # -------------------------------------------------------------------------
     #  Main Training Loop
     # -------------------------------------------------------------------------
@@ -273,34 +346,36 @@ def train_func(config_dict: Dict):
 
     while epoch < max_epochs and global_step < max_train_steps:
         model.train()
-
-        batch_iterator = ds_train.iter_torch_batches(
-            batch_size=train_config.get("batch_size", 1),
-            prefetch_batches=train_config.get("prefetch", 2),
-            pin_memory=pin_memory,
-        )
-
-        optimizer.zero_grad()
+        batch_iterator = batch_source.start_epoch(epoch)
+        epoch_start_step = global_step
+        latest_train_loss = None
+        accumulator.start_epoch()
 
         for batch_idx, batch in enumerate(batch_iterator):
             if os.path.exists(".stop_signal"):
                 if rank == 0:
-                    print(f"[Epoch {epoch}] Graceful stop signal detected. Exiting batch loop cleanly.")
+                    print(
+                        f"[Epoch {epoch}] Graceful stop signal detected. "
+                        "Exiting batch loop cleanly."
+                    )
                 break
 
             if multi_scale:
-                inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_native_batch(
-                    batch, num_levels_native, device, non_blocking=pin_memory
+                inputs_by_level, targets_by_level, bucket_layout = prepare_multi_scale_batch(
+                    batch, num_levels_native, device, non_blocking=pin_memory,
+                    geometry=_ensure_geom(batch) if loss_mode == "full_field" else None,
                 )
+                leaf_to_bucket, centers = bucket_layout.leaf_to_bucket, bucket_layout.centers
                 mask_1d = None  # per-bucket masking not yet wired for multi-scale
                 with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(amp_dtype is not None and mixed_precision != "no")):
                     curr_inputs = inputs_by_level
                     input_seq_len = next(iter(inputs_by_level.values())).shape[2]
                     T_out = next(iter(targets_by_level.values())).shape[2]
-                    assert T_out % num_push_forward_steps == 0, (
-                        f"native target T_out ({T_out}) not divisible by "
-                        f"num_push_forward_steps ({num_push_forward_steps})"
-                    )
+                    if T_out % num_push_forward_steps != 0:
+                        raise ValueError(
+                            f"native target T_out ({T_out}) not divisible by "
+                            f"num_push_forward_steps ({num_push_forward_steps})"
+                        )
                     return_seq_len = T_out // num_push_forward_steps
 
                     step_total_loss = 0.0
@@ -314,12 +389,16 @@ def train_func(config_dict: Dict):
                         else:
                             targets_learning = curr_target
                         pred_by_level = model(
-                            curr_inputs, centers, leaf_to_bucket=leaf_to_bucket,
+                            curr_inputs,
+                            centers,
+                            leaf_to_bucket=leaf_to_bucket,
+                            bucket_layout=bucket_layout,
                         )
                         if loss_mode == "full_field":
                             step_loss = full_field_loss(
                                 loss_fn, pred_by_level, targets_learning,
                                 leaf_to_bucket, centers, _ensure_geom(batch),
+                                bucket_layout=bucket_layout,
                             )
                         else:
                             step_loss = multi_scale_loss(loss_fn, pred_by_level, targets_learning)
@@ -330,23 +409,11 @@ def train_func(config_dict: Dict):
                                 return_seq_len, train_config["pred_mode"],
                             )
                     loss = step_total_loss / num_push_forward_steps
-                loss = loss / grad_accum_steps
-                loss.backward()
-                if (batch_idx + 1) % grad_accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    if lr_scheduler is not None:
-                        lr_scheduler.step()
-                    if ema_model is not None:
-                        ema_model.step(model.parameters())
-                    global_step += 1
-                    loss_val = float(loss.item() * grad_accum_steps)
-                    if wandb_enabled and is_main_process() and is_wandb_available():
-                        logs = {"train/loss": loss_val, "epoch": epoch, "step": global_step}
-                        if lr_scheduler:
-                            logs["train/lr"] = lr_scheduler.get_last_lr()[0]
-                        wandb.log(logs, step=global_step)
+                update_loss = accumulator.backward(loss)
+                if update_loss is not None:
+                    record_optimizer_update(update_loss)
+                if is_step_based and global_step >= max_train_steps:
+                    break
                 continue
 
             seq_in = batch["input"].to(device, non_blocking=pin_memory)
@@ -364,7 +431,7 @@ def train_func(config_dict: Dict):
                 centers = make_regular_centers(seq_in.shape[-2], seq_in.shape[-1], p=model_config["patch_size"], device=device)
 
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(amp_dtype is not None and mixed_precision != "no")):
-                curr_input_seq = seq_in.clone()
+                curr_input_seq = seq_in  # Read-only; advance_window replaces the window.
                 input_seq_len = curr_input_seq.shape[2]
                 return_seq_len = target.shape[2] // num_push_forward_steps
 
@@ -380,7 +447,7 @@ def train_func(config_dict: Dict):
                     else:
                         curr_target_learning = curr_target
 
-                    pred = model(curr_input_seq, centers)
+                    pred = model(curr_input_seq, centers)  # (N, C, R, Ph, Pw)
                     step_loss = loss_fn(pred, curr_target_learning, mask=mask_1d)
                     step_total_loss += step_loss
 
@@ -392,43 +459,73 @@ def train_func(config_dict: Dict):
 
                 loss = step_total_loss / num_push_forward_steps
 
-            # Scale the loss by the number of accumulation steps
-            loss = loss / grad_accum_steps
+            update_loss = accumulator.backward(loss)
+            if update_loss is not None:
+                active_grid_ratio = (
+                    num_active_grids / seq_in.shape[0]
+                    if loss_mask_scheduler is not None and model_config["adaptive"]
+                    else None
+                )
+                record_optimizer_update(
+                    update_loss,
+                    active_grid_ratio=active_grid_ratio,
+                )
 
-            # Backward pass happens every batch
-            loss.backward()
-
-            # Optimizer step and logging happen only every `grad_accum_steps`
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-
-                if lr_scheduler is not None:
-                    lr_scheduler.step()
-
-                if ema_model is not None:
-                    ema_model.step(model.parameters())
-
-                global_step += 1
-
-                # Logging
-                loss_val = float(loss.item() * grad_accum_steps) # Unscale for logging
-
-                if wandb_enabled and is_main_process() and is_wandb_available():
-                    logs = {"train/loss": loss_val, "epoch": epoch, "step": global_step}
-                    if lr_scheduler:
-                        logs["train/lr"] = lr_scheduler.get_last_lr()[0]
-                    if loss_mask_scheduler is not None and model_config["adaptive"]:
-                        logs["train/active_grid_ratio"] = num_active_grids / seq_in.shape[0]
-                    wandb.log(logs, step=global_step)
+            if is_step_based and global_step >= max_train_steps:
+                break
+        else:
+            update_loss = accumulator.flush()
+            if update_loss is not None:
+                record_optimizer_update(update_loss)
 
         if os.path.exists(".stop_signal"):
+            batch_source.close_epoch()
             if rank == 0:
                 print("Exiting epoch loop due to stop signal.")
             break
 
-        current_metrics = {"epoch": epoch, "step": global_step}
+        if is_step_based and global_step >= max_train_steps:
+            batch_source.close_epoch()
+            train.report({"epoch": epoch, "step": global_step})
+            break
+
+        batch = None
+        transport_metrics, transport_wandb_metrics = batch_source.finish_epoch(epoch)
+        epoch_updates = global_step - epoch_start_step
+        if epoch_updates != num_update_steps_per_epoch:
+            raise RuntimeError(
+                f"Epoch {epoch} made {epoch_updates} optimizer updates; "
+                f"expected {num_update_steps_per_epoch}."
+            )
+        if latest_train_loss is None:
+            raise RuntimeError(f"Epoch {epoch} completed without an optimizer update.")
+        epoch_train_loss = float(latest_train_loss.item())
+        if not math.isfinite(epoch_train_loss):
+            raise FloatingPointError(
+                f"Epoch {epoch} ended with non-finite training loss {epoch_train_loss}."
+            )
+        if rank == 0:
+            print(
+                f"[Epoch {epoch}] optimizer updates: actual={epoch_updates} "
+                f"expected={num_update_steps_per_epoch} global_step={global_step} "
+                f"last_group_mean_loss={epoch_train_loss:.8g}"
+            )
+        if (
+            transport_wandb_metrics
+            and wandb_enabled
+            and is_main_process()
+            and is_wandb_available()
+        ):
+            wandb.log(transport_wandb_metrics, step=global_step)
+
+        current_metrics = {
+            "epoch": epoch,
+            "step": global_step,
+            "optimizer_updates_this_epoch": epoch_updates,
+            "optimizer_updates_per_epoch": num_update_steps_per_epoch,
+            "train_loss": epoch_train_loss,
+            **transport_metrics,
+        }
 
         if save_freq is None:
             should_save = False
@@ -454,7 +551,11 @@ def train_func(config_dict: Dict):
             ema_model.store(model.parameters())
             ema_model.copy_to(model.parameters())
 
-        final_save_path = os.path.join(general_config["save_dir"], general_config.get("run_name", "amrex_run"), "model")
+        final_save_path = os.path.join(
+            general_config["save_dir"],
+            general_config.get("run_name", "train_run"),
+            "model",
+        )
         os.makedirs(final_save_path, exist_ok=True)
 
         print(f"Saving final model to {final_save_path}...")
@@ -475,18 +576,40 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None, help="Path to standalone yaml file (legacy). Omit to use Hydra config groups.")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging.")
-    parser.add_argument("--load_in_ram", action="store_true", help="Whether to load entire dataset into RAM. Not recommended for large datasets.")
+    parser.add_argument(
+        "--load_in_ram",
+        action="store_true",
+        help=(
+            "Deprecated alias for ray_resident; requires a validated "
+            "train.resident_payload_estimate_gib capacity preflight."
+        ),
+    )
     parser.add_argument("--cache_topology", action="store_true", help="Materialize quadtree topology in a first stage. Augmentation stays lazy and varies per epoch.")
     parser.add_argument("--topology_cache_dir", type=str, default=None, help="Directory to save/load cached Ray datasets for quadtree topology.")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode with fewer epochs and smaller dataset.")
     args, unknown = parser.parse_known_args()
 
     config = load_config(args, unknown)
+    train_config = config["train"]
+    resolved_transport, capacity_decision = configure_payload_transport(
+        config,
+        load_in_ram=args.load_in_ram,
+        topology_cached=args.cache_topology,
+    )
+
+    validate_source_provider(config, topology_cached=args.cache_topology)
+    from wamrvit.dataloader.selection.windows import prepare_window_splits, validate_temporal_config
+
+    validate_temporal_config(config, topology_cached=args.cache_topology)
 
     # 1. Initialize Ray
     if not ray.is_initialized():
-        ray.init(object_store_memory=config["general"].get("ray_object_store_memory", 8) * 1024 * 1024 * 1024,
-                 object_spilling_directory=config["general"].get("ray_spill_dir", None))
+        ray.init(
+            object_store_memory=int(
+                config["general"].get("ray_object_store_memory", 8) * 1024**3
+            ),
+            object_spilling_directory=config["general"].get("ray_spill_dir"),
+        )
 
     # 2. Data Discovery
     data_config = config["data"]
@@ -498,26 +621,34 @@ def main():
 
     print(f"Found {len(all_paths)} snapshots.")
 
-    window_config = dict(config["window_generator"])
-    window_config["params"]["return_seq_len"] *= config["train"].get("num_push_forward_steps", 1)
-    params = dict(window_config.get("params", {}))
-    params["file_path_list"] = all_paths # avoid flooding logs
-    window_config["params"] = params
-    assert window_config["params"]["return_seq_len"] == int(config["model"].get("return_seq_len", 1)*config["train"].get("num_push_forward_steps", 1)), \
-        f"Return sequence length in window generator ({window_config['params']['return_seq_len']}) \
-            must match model config ({config['model'].get('return_seq_len', 1)}) * num_push_forward_steps ({config['train'].get('num_push_forward_steps', 1)})."
+    from wamrvit.dataloader.selection.sources import prepare_source_partitions
+    from wamrvit.dataloader.selection.splits import record_source_partitions
 
-    windows = instantiate_from_config(window_config)
-
-    split_idx = int(len(windows) * config["train"]["split_ratio"])
-    train_windows = windows[:split_idx]
-    print(f"Using first {split_idx} of {len(windows)} windows for training (split_ratio {config['train']['split_ratio']}).")
-
+    source_partitions = prepare_source_partitions(config, all_paths)
+    record_source_partitions(all_paths, source_partitions, config)
+    _, windows_by_role = prepare_window_splits(config, source_partitions)
+    train_windows = windows_by_role["train"]
+    print(f"Using {len(train_windows)} training windows.")
     data_config["num_train_samples"] = len(train_windows)
+    world_size = positive_int(train_config, "num_gpus", 1)
+    if len(train_windows) < world_size:
+        raise ValueError(
+            f"Training has {len(train_windows)} windows for {world_size} ranks."
+        )
+    print(
+        "Ray scheduling: random shuffle and equal splitting; exact "
+        "cross-session rank-lane replay is not enforced."
+    )
 
-    # 5. Create Ray Datasets
-    # Turn the list of dicts into a distributed dataset
-    ds_train = ray.data.from_items(train_windows)
+    prepare_source_provider(
+        config,
+        train_windows,
+        topology_cached=args.cache_topology,
+    )
+
+    # Adaptive topology construction remains seed-independent; each pipeline
+    # creates its own descriptors, and Ray owns shuffle and equal splitting.
+    is_adaptive = config["model"].get("adaptive", False)
 
     # 6. Instantiate Loader & Mapper
     file_loader = instantiate_from_config(config["file_loader"])
@@ -525,40 +656,50 @@ def main():
 
     # 7. Apply Map Batches
     mem_per_task = 10 * 1024 * 1024 * 1024  # 10 GiB
-    map_batch_size = config["train"].get("map_batch_size", 1)
-    actor_pool_size = config["train"].get("actor_pool_size", None)
-
-    is_adaptive = config["model"].get("adaptive", False)
+    map_batch_size = train_config.get("map_batch_size", 1)
+    actor_pool_size = train_config.get("actor_pool_size")
 
     if args.cache_topology and is_adaptive:
-        # Two-stage pipeline: cached topology + lazy augmentation ---
+        # Two-stage pipeline: cached topology + lazy augmentation.
         ds_train = apply_two_stage_topology_pipeline(
-            ds_train, train_windows, "train", config, args,
-            map_batch_size, actor_pool_size, mem_per_task, transform
+            train_windows,
+            "train",
+            config,
+            args,
+            map_batch_size,
+            actor_pool_size,
+            mem_per_task,
+            transform,
         )
-
     else:
-        # single-stage pipeline ---
-        ds_train = ds_train.random_shuffle(seed=config["train"]["seed"])
+        ds_train = ray.data.from_items(train_windows)
         train_mapper = Seq2SeqMapper(loader=file_loader, transform=transform)
-
+        stage2_pool_size = train_config.get(
+            "ray_stream_map_concurrency", actor_pool_size
+        )
+        ds_train = ds_train.random_shuffle(seed=train_config["seed"])
         ds_train = ds_train.map_batches(
             train_mapper,
             batch_size=map_batch_size,
             batch_format="numpy",
-            compute=ray.data.TaskPoolStrategy(size=actor_pool_size),
+            compute=ray.data.TaskPoolStrategy(size=stage2_pool_size),
             memory=mem_per_task,
         )
 
-        if args.load_in_ram:
-            print("Materializing Training Data into RAM (this may take a while)...")
-            ds_train = ds_train.materialize()
-            print("Materialization Complete. Data is now pinned in memory.")
+    if resolved_transport == "ray_resident":
+        print("Materializing training data into Ray's object store...")
+        resident_limit = int(capacity_decision["usable_object_store_gib"] * 1024**3)
+        materialized, resident_bytes = materialize_with_capacity(
+            [ds_train], max_total_bytes=resident_limit
+        )
+        ds_train = materialized[0]
+        train_config["resident_materialized_bytes"] = resident_bytes
+        print(f"Resident materialization complete: {resident_bytes / 1024**3:.3f} GiB.")
 
     # 8. Trainer Configuration
     run_config = RunConfig(
         storage_path=os.path.abspath(config["general"]["save_dir"]),
-        name=config["general"].get("run_name", "amrex_run"),
+        name=config["general"].get("run_name", "train_run"),
         checkpoint_config=CheckpointConfig(
             num_to_keep=3,
         ),

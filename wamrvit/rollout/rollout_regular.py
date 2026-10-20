@@ -1,18 +1,18 @@
 import argparse
 import math
 import os
-from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 import ray
 import torch
 
-from wamrvit.dataloader.loader import YTAmReXRegularLoader
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.quad.yt_utils import make_regular_centers
-from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.rollout.regular_metrics import METRIC_REGISTRY
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.payload.loaders import YTAmReXRegularLoader
+from wamrvit.dataloader.selection.splits import prepare_evaluation_windows
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.quad.quad_utils import make_regular_centers
+from wamrvit.rollout.regular_metrics import METRIC_REGISTRY, mean_numeric_result_columns
 from wamrvit.utils import instantiate_from_config, load_config
 
 
@@ -23,32 +23,7 @@ class AutoregressivePredictor:
 
         inf_cfg = config["inference"]
 
-        model_class_name = config["model"].get("_class_name", "QuadTreeTransformer")
-        if inf_cfg.get("is_diffusers", False):
-            import json
-
-            ckpt_config_path = os.path.join(inf_cfg["checkpoint_path"], "config.json")
-            if os.path.exists(ckpt_config_path):
-                with open(ckpt_config_path) as f:
-                    model_class_name = json.load(f).get("_class_name", model_class_name)
-
-        if model_class_name == "SwinV2Transformer":
-            from wamrvit.swin_transformer import SwinV2Transformer
-
-            model_cls = SwinV2Transformer
-        else:
-            model_cls = QuadTreeTransformer
-
-        if inf_cfg.get("is_diffusers", False):
-            print("Loading model via diffusers from:", inf_cfg["checkpoint_path"])
-            self.model = model_cls.from_pretrained(inf_cfg["checkpoint_path"])
-        else:
-            print("Loading model state dict from:", inf_cfg["checkpoint_path"])
-            self.model = model_cls(**config["model"])
-            state_dict = torch.load(inf_cfg["checkpoint_path"], map_location="cpu")
-            if "module." in list(state_dict.keys())[0]:
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            self.model.load_state_dict(state_dict)
+        self.model = load_model(inf_cfg["checkpoint_path"], config["model"])
 
         self.model.to(self.device)
         self.model.eval()
@@ -228,6 +203,8 @@ def main():
     config["inference"]["model_name"] = model_name
 
     default_csv = f"rmse_{model_name}_steps{steps}.csv"
+    if config["inference"].get("split_policy", "internal") != "prepartitioned":
+        default_csv = default_csv.removesuffix(".csv") + "_heldout.csv"
 
     csv_path = config["inference"].get("output_csv") or os.path.join("results", default_csv)
     if not os.path.isabs(csv_path):
@@ -235,56 +212,18 @@ def main():
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     config["inference"]["output_csv"] = csv_path
 
-    if not ray.is_initialized():
-        ray.init(
-            object_store_memory=config["inference"].get("ray_object_store_memory", 10)
-            * 1024
-            * 1024
-            * 1024
-        )
-
     data_config = config["data"]
     file_parser = instantiate_from_config(config["file_parser"])
     all_paths = file_parser(data_config["glob_pattern"])
 
-    # Build windows from config so we can support both single-trajectory PLT and
-    # multi-trajectory NPZ parsers with one rollout script.
-    window_config = dict(config["window_generator"])
-    window_config["params"]["return_seq_len"] = config["inference"].get("predict_steps", 1)
-    params = dict(window_config.get("params", {}))
-    params["file_path_list"] = all_paths
-    window_config["params"] = params
-    windows = instantiate_from_config(window_config)
-
-    # Keep train/val split behavior configurable and consistent with adaptive rollout.
-    split_idx = int(len(windows) * config["inference"].get("split_ratio", 0.8))
-    windows = windows[split_idx:]
-
-    if not args.eval_full:
-        windows = windows[::steps]
-        print(f"Evaluating every {steps} steps. Total evaluation samples: {len(windows)}")
-
-    if args.debug:
-        windows = windows[:100]
-
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            w["idx"] = i
-
-    total_samples = len(windows)
-
-    # Group windows by trajectory ID for logging
-    traj_to_indices = defaultdict(list)
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            t_id = w.get("traj_idx", 0)
-            traj_to_indices[t_id].append(i)
-
-    print(
-        f"Total samples in validation split: {total_samples}, "
-        f"Trajectories: {len(traj_to_indices)}\n"
+    windows = prepare_evaluation_windows(
+        all_paths, config, eval_full=args.eval_full, debug=args.debug,
     )
 
+    if not ray.is_initialized():
+        ray.init(
+            object_store_memory=config["inference"].get("ray_object_store_memory", 10) * 1024**3
+        )
     ds = ray.data.from_items(windows)
 
     # Use explicit loader from config when present (e.g., NPZ regular path).
@@ -364,7 +303,7 @@ def main():
             "The evaluation dataset is empty! Check your glob pattern and debug split logic."
         )
 
-    mean_mse = df.mean(numeric_only=True)
+    mean_mse = mean_numeric_result_columns(df)
     rmse_series = np.sqrt(mean_mse)
 
     results_dict = {"Step": []}
@@ -381,7 +320,7 @@ def main():
 
     # Check if uniform metric columns are present in the results
     has_uniform = any(col.startswith("step_0_uniform_") for col in df.columns)
-    mean_uniform = df.mean(numeric_only=True) if has_uniform else None
+    mean_uniform = mean_mse if has_uniform else None
     if has_uniform:
         for m in metrics:
             for field in eval_fields:

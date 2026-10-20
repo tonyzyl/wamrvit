@@ -3,7 +3,7 @@ import math
 import os
 import time
 import warnings
-from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any
 
 import numpy as np
@@ -12,10 +12,11 @@ import ray
 import torch
 from numba import get_num_threads
 
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.dataloader.transform import inverse_transform_src
-from wamrvit.native_train_utils import unpack_native_batch
-from wamrvit.quad.adapt_wavelet import regrid_native
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.selection.splits import prepare_evaluation_windows
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.dataloader.payload.transforms import inverse_transform_src, transform_regrid_values
+from wamrvit.multi_scale import unpack_multi_scale_batch
 from wamrvit.quad.array_regrid import configure_array_regrid_num_threads
 from wamrvit.quad.regrid_dispatch import (
     regrid_native_dispatch,
@@ -31,14 +32,77 @@ from wamrvit.quad.quad_utils import (
     tensor_to_uniform,
     tensor_to_uniform_native,
 )
-from wamrvit.quadtree_transformer import QuadTreeTransformer
-from wamrvit.rollout.regular_metrics import METRIC_REGISTRY, eval_per_level_metric
+from wamrvit.rollout.regular_metrics import (
+    METRIC_REGISTRY,
+    eval_per_level_metric,
+    mean_numeric_result_columns,
+)
 from wamrvit.utils import instantiate_from_config, load_config
 
 # ---------------------------------------------------------------------------
-# Shared helpers for native-mode metric evaluation
+# Shared helpers for metric evaluation
 # (used by MetricEvaluator and CombinedMetricEvaluator in rollout_combined)
 # ---------------------------------------------------------------------------
+
+
+def leaf_export_order(qt, export_meta, step_meta, *, cell_scale_mode):
+    """Map exported rows to prediction leaves; None preserves the ordered fast path."""
+    if (
+        np.array_equal(export_meta["centers"], step_meta["centers"])
+        and np.array_equal(export_meta["levels"], step_meta["levels"])
+    ):
+        return None
+
+    positions = {int(uid): i for i, uid in enumerate(export_meta["cell_ids"])}
+    centers = step_meta["centers"]
+    x, y = centers[:, 0], centers[:, 1]
+    if cell_scale_mode is not None:
+        domain = step_meta["domain"]
+        x = x * (domain["xmax"] - domain["xmin"]) + domain["xmin"]
+        y = y * (domain["ymax"] - domain["ymin"]) + domain["ymin"]
+    return np.array(
+        [positions[int(qt.cell_uid_64bit(qt.locate_leaf(cx, cy)))] for cx, cy in zip(x, y)],
+        dtype=np.int64,
+    )
+
+
+def build_uniform_gt(
+    pred_frame: np.ndarray,
+    step_meta: dict[str, Any],
+    *,
+    gt_src_frame: np.ndarray | None = None,
+    gt_src_path: str | None = None,
+    amrex_field_names=None,
+    amrex_patch_size: int | tuple[int, int] = 32,
+    cell_scale_mode: str = "area",
+):
+    """Project dense or AMReX GT onto the prediction's uniform-patch quadtree.
+
+    ``pred_frame`` supplies only the ``(N, C, Ph, Pw)`` shape. Dense GT takes
+    precedence over a source path. Return ``(gt_patches, quadtree)`` so combined
+    evaluation can reuse the same structure to project its regular prediction.
+    Returned patches follow the prediction's leaf order.
+    """
+    if gt_src_frame is None and gt_src_path is None:
+        raise ValueError("Uniform GT projection requires a dense frame or source path.")
+    qt = tensor_to_quadtree(
+        np.zeros(pred_frame.shape, dtype=np.float32),
+        step_meta,
+        cell_scale_mode=cell_scale_mode,
+    )
+    if gt_src_frame is not None:
+        qt.assign_from_array(gt_src_frame)
+    else:
+        from wamrvit.quad.amrex_to_qt import assign_from_amrex
+
+        assign_from_amrex(qt, gt_src_path, amrex_field_names, patch_size=amrex_patch_size)
+    gt_patches, export_meta = quadtree_to_tensor(
+        qt, return_tensor=False, cell_scale_mode=cell_scale_mode
+    )
+    order = leaf_export_order(qt, export_meta, step_meta, cell_scale_mode=cell_scale_mode)
+    if order is not None:
+        gt_patches = gt_patches[order]
+    return gt_patches, qt
 
 
 def build_native_gt_buckets(
@@ -59,7 +123,7 @@ def build_native_gt_buckets(
         cell_scale_mode: Scale mode for center/level encoding.
 
     Returns:
-        ``{lvl: (N_l, C, H_l, W_l)}`` GT per-level arrays.
+        ``{lvl: (N_l, C, H_l, W_l)}`` GT arrays in prediction bucket order.
     """
     zero_buckets = {
         lvl: np.zeros_like(arr[:, :, 0]) if arr.ndim == 5 else np.zeros_like(arr)
@@ -69,8 +133,18 @@ def build_native_gt_buckets(
         zero_buckets, step_l2b, step_meta, cell_scale_mode=cell_scale_mode
     )
     qt.assign_from_array(gt_src_frame)
-    gt_buckets, _, _ = quadtree_to_tensor_native(qt, cell_scale_mode=cell_scale_mode)
-    return gt_buckets
+    gt_buckets, gt_l2b, export_meta = quadtree_to_tensor_native(qt, cell_scale_mode=cell_scale_mode)
+    order = leaf_export_order(qt, export_meta, step_meta, cell_scale_mode=cell_scale_mode)
+    if order is None:
+        if np.array_equal(gt_l2b, step_l2b):
+            return gt_buckets
+        order = np.arange(len(step_l2b))
+
+    aligned = {level: np.empty_like(bucket) for level, bucket in gt_buckets.items()}
+    for level, bucket in aligned.items():
+        mask = step_l2b[:, 0] == level
+        bucket[step_l2b[mask, 1]] = gt_buckets[level][gt_l2b[order[mask], 1]]
+    return aligned
 
 
 def eval_per_level_metrics(
@@ -173,25 +247,12 @@ def eval_native_uniform_metrics(
 
 
 class AutoregressivePredictorAdaptive:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, checkpoint_key: str = "checkpoint_path"):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         inf_cfg = config["inference"]
-        if inf_cfg.get("is_diffusers", True):
-            print("Loading model via diffusers from:", inf_cfg["checkpoint_path"])
-            self.model = QuadTreeTransformer.from_pretrained(inf_cfg["checkpoint_path"])
-        else:
-            print("Loading model state dict from:", inf_cfg["checkpoint_path"])
-            self.model = QuadTreeTransformer(**config["model"])
-            state_dict = torch.load(inf_cfg["checkpoint_path"], map_location="cpu")
-            if "module." in list(state_dict.keys())[0]:
-                state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-            self.model.load_state_dict(state_dict)
-
-        assert self.model.config.adaptive, (
-            "Loaded model must be an adaptive QuadTreeTransformer for this rollout script."
-        )
+        self.model = load_model(inf_cfg[checkpoint_key], config["model"])
         self.multi_scale = getattr(self.model.config, "multi_scale_patch", False)
         self.num_levels = int(self.model.config.max_level_idx) + 1 if self.multi_scale else 0
 
@@ -210,9 +271,9 @@ class AutoregressivePredictorAdaptive:
         self.cell_scale_mode = loader_params.get("cell_scale_mode", "area")
         self.adapt_on_channels = loader_params.get("adapt_on_channels", None)
         self.tol_frac = loader_params.get("tol_frac", 0.01)
+        self.allow_coarsening = inf_cfg.get("allow_coarsening", True)
         if inf_cfg.get("regrid_tol_frac") is not None:
             self.regrid_tol_frac = inf_cfg["regrid_tol_frac"]
-            self.allow_coarsening = inf_cfg.get("allow_coarsening", True)
         else:
             warnings.warn(
                 "regrid_tol_frac not set in inference config, "
@@ -283,6 +344,16 @@ class AutoregressivePredictorAdaptive:
             return self._call_native(batch)
         return self._call_uniform(batch)
 
+    def _time_phase(self, name: str):
+        """Standalone rollout never synchronizes CUDA just to collect timings."""
+        return nullcontext()
+
+    def _format_output(self, out: dict, batch: dict, *, leaf_to_bucket=None) -> dict:
+        """Standalone schema; combined overrides without copying dense input_src."""
+        if leaf_to_bucket is not None:
+            out["ref_leaf_to_bucket"] = np.expand_dims(leaf_to_bucket.cpu().numpy(), 0)
+        return out
+
     def _call_uniform(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         def _unpack(arr):
             return arr[0] if arr.dtype == object else arr
@@ -315,7 +386,6 @@ class AutoregressivePredictorAdaptive:
 
         ref_meta = {"centers": ref_centers_np, "levels": ref_levels_np, "domain": domain}
 
-        meta = ref_meta
         centers = torch.from_numpy(ref_centers_np).to(self.device, dtype=torch.float32)
 
         if inputs.ndim == 6:
@@ -328,6 +398,7 @@ class AutoregressivePredictorAdaptive:
             ref_meta["centers"] = ref_centers_np
             ref_meta["levels"] = ref_levels_np
 
+        meta = ref_meta
         N_grids, C, T_in, H, W = inputs.shape  # H == Ph, W == Pw
         R = self.model_return_seq_len
 
@@ -350,97 +421,106 @@ class AutoregressivePredictorAdaptive:
                     and timestep_idx > 0
                     and timestep_idx % self.regrid_interval == 0
                 ):
-                    N, c_in, t_in, h, w = curr_input_seq.shape  # (N, C, T_in, Ph, Pw)
-                    # Adapt on the last frame's channels (offset into packed T*C axis).
-                    ch_offset = (t_in - 1) * c_in
-                    use_channels = (
-                        [ch + ch_offset for ch in self.adapt_on_channels]
-                        if self.adapt_on_channels is not None
-                        else list(range(ch_offset, t_in * c_in))
-                    )
+                    with self._time_phase("time_adaptive_regrid"):
+                        N, c_in, t_in, h, w = curr_input_seq.shape  # (N, C, T_in, Ph, Pw)
+                        regrid_input = transform_regrid_values(
+                            self.transform, curr_input_seq, inverse=True
+                        )
+                        # Adapt on the last frame's channels (offset into packed T*C axis).
+                        ch_offset = (t_in - 1) * c_in
+                        use_channels = (
+                            [ch + ch_offset for ch in self.adapt_on_channels]
+                            if self.adapt_on_channels is not None
+                            else list(range(ch_offset, t_in * c_in))
+                        )
 
-                    if self.regrid_backend == "array":
-                        # Keep the model's sequence layout and let source storage retain
-                        # initial leaves there instead of copying the full AMReX payload
-                        # into the fixed-capacity mutable workspace.
-                        sequence_input = (
-                            curr_input_seq
-                            if self.array_regrid_payload_backend == "gpu_replay"
-                            else curr_input_seq.detach().cpu().numpy()
-                        )
-                        new_sequence_np, meta = regrid_uniform_sequence_dispatch(
-                            sequence_input,
-                            meta,
-                            backend="array",
-                            profiler=self.regrid_profiler,
-                            max_passes=10,
-                            cell_scale_mode=self.cell_scale_mode,
-                            tol_frac=self.regrid_tol_frac,
-                            channel=use_channels,
-                            adapt_nearby=self.regrid_adapt_nearby,
-                            allow_coarsening=self.allow_coarsening,
-                            value_storage=self.array_regrid_value_storage,
-                            capacity=self.array_regrid_capacity,
-                            payload_backend=self.array_regrid_payload_backend,
-                            detector_channels=self.adapt_on_channels,
-                            detector_fields=self.regrid_detector_fields,
-                        )
-                    else:
-                        # Preserve the established object path exactly: pack time×channel
-                        # into the axis expected by tensor_to_quadtree.
-                        flat_input = (
-                            curr_input_seq.transpose(1, 2)
-                            .contiguous()
-                            .view(N, t_in * c_in, h, w)
-                            .cpu()
-                            .numpy()
-                        )
-                        new_input_np, meta = regrid_uniform_dispatch(
-                            flat_input,
-                            meta,
-                            backend="object",
-                            profiler=self.regrid_profiler,
-                            max_passes=10,
-                            cell_scale_mode=self.cell_scale_mode,
-                            tol_frac=self.regrid_tol_frac,
-                            channel=use_channels,
-                            adapt_nearby=self.regrid_adapt_nearby,
-                            allow_coarsening=self.allow_coarsening,
-                        )
-                        new_N = new_input_np.shape[0]
-                        new_sequence_np = np.ascontiguousarray(
-                            new_input_np.reshape(new_N, t_in, c_in, h, w)
-                            .transpose(0, 2, 1, 3, 4))
+                        if self.regrid_backend == "array":
+                            # Keep the model's sequence layout and let source storage retain
+                            # initial leaves there instead of copying the full AMReX payload
+                            # into the fixed-capacity mutable workspace.
+                            sequence_input = (
+                                regrid_input
+                                if self.array_regrid_payload_backend == "gpu_replay"
+                                else regrid_input.detach().cpu().numpy()
+                            )
+                            new_sequence_np, meta = regrid_uniform_sequence_dispatch(
+                                sequence_input,
+                                meta,
+                                backend="array",
+                                profiler=self.regrid_profiler,
+                                max_passes=10,
+                                cell_scale_mode=self.cell_scale_mode,
+                                tol_frac=self.regrid_tol_frac,
+                                channel=use_channels,
+                                adapt_nearby=self.regrid_adapt_nearby,
+                                allow_coarsening=self.allow_coarsening,
+                                value_storage=self.array_regrid_value_storage,
+                                capacity=self.array_regrid_capacity,
+                                payload_backend=self.array_regrid_payload_backend,
+                                detector_channels=self.adapt_on_channels,
+                                detector_fields=self.regrid_detector_fields,
+                            )
+                        else:
+                            # Preserve the established object path exactly: pack time×channel
+                            # into the axis expected by tensor_to_quadtree.
+                            flat_input = (
+                                regrid_input.transpose(1, 2)
+                                .contiguous()
+                                .view(N, t_in * c_in, h, w)
+                                .cpu()
+                                .numpy()
+                            )
+                            new_input_np, meta = regrid_uniform_dispatch(
+                                flat_input,
+                                meta,
+                                backend="object",
+                                profiler=self.regrid_profiler,
+                                max_passes=10,
+                                cell_scale_mode=self.cell_scale_mode,
+                                tol_frac=self.regrid_tol_frac,
+                                channel=use_channels,
+                                adapt_nearby=self.regrid_adapt_nearby,
+                                allow_coarsening=self.allow_coarsening,
+                            )
+                            new_N = new_input_np.shape[0]
+                            new_sequence_np = np.ascontiguousarray(
+                                new_input_np.reshape(new_N, t_in, c_in, h, w)
+                                .transpose(0, 2, 1, 3, 4))
 
-                    centers = torch.from_numpy(meta["centers"]).to(
-                        self.device, dtype=torch.float32
-                    )
-                    curr_input_seq = (
-                        new_sequence_np.to(self.device, dtype=torch.float32)
-                        if isinstance(new_sequence_np, torch.Tensor)
-                        else torch.from_numpy(new_sequence_np).to(
+                        new_sequence_np = transform_regrid_values(
+                            self.transform, new_sequence_np, inverse=False
+                        )
+                        centers = torch.from_numpy(meta["centers"]).to(
                             self.device, dtype=torch.float32
                         )
-                    )
+                        curr_input_seq = (
+                            new_sequence_np.to(self.device, dtype=torch.float32)
+                            if isinstance(new_sequence_np, torch.Tensor)
+                            else torch.from_numpy(new_sequence_np).to(
+                                self.device, dtype=torch.float32
+                            )
+                        )
                 # -------------------------------------
 
-                pred_full = self.model(curr_input_seq, centers)  # (N, C, R, Ph, Pw)
+                with self._time_phase("time_adaptive_forward"):
+                    pred_full = self.model(curr_input_seq, centers)  # (N, C, R, Ph, Pw)
 
-                if self.pred_mode == "residual":
-                    # Add back the last input frame → absolute prediction.
-                    pred_full = pred_full + curr_input_seq[:, :, -1].unsqueeze(
-                        2
-                    )  # (N, C, R, Ph, Pw)
+                with self._time_phase("time_adaptive_post"):
+                    if self.pred_mode == "residual":
+                        # Add back the last input frame → absolute prediction.
+                        pred_full = pred_full + curr_input_seq[:, :, -1].unsqueeze(
+                            2
+                        )  # (N, C, R, Ph, Pw)
 
-                pred_to_store = pred_full[:, :, :steps_this_call]  # (N, C, steps_this_call, Ph, Pw)
-                pred_np = pred_to_store.cpu().numpy()
+                    pred_to_store = pred_full[:, :, :steps_this_call]  # (N, C, steps_this_call, Ph, Pw)
+                    pred_np = pred_to_store.cpu().numpy()
 
-                if hasattr(self.transform, "inverse_transform") and callable(
-                    self.transform.inverse_transform
-                ):
-                    pred_phys = self.transform.inverse_transform(pred_np)
-                else:
-                    pred_phys = pred_np
+                    if hasattr(self.transform, "inverse_transform") and callable(
+                        self.transform.inverse_transform
+                    ):
+                        pred_phys = self.transform.inverse_transform(pred_np)
+                    else:
+                        pred_phys = pred_np
 
                 # Store per-timestep predictions and current grid metadata.
                 for t in range(steps_this_call):
@@ -502,7 +582,7 @@ class AutoregressivePredictorAdaptive:
 
         if self.regrid_profiler is not None:
             self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
-        return out_dict
+        return self._format_output(out_dict, batch)
 
     # ------------------------------------------------------------------
     # Native (multi-scale) rollout path
@@ -521,12 +601,13 @@ class AutoregressivePredictorAdaptive:
         # Unpack per-level input/target columns.
         # inputs_by_level / targets_by_level: {lvl: (N_l, C, T, H_l, W_l)};
         # leaf_to_bucket: (N, 2); centers: (N, 3).
-        inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_native_batch(
+        inputs_by_level, targets_by_level, leaf_to_bucket, centers = unpack_multi_scale_batch(
             batch,
             self.num_levels,
             self.device,
             non_blocking=False,
         )
+        ref_leaf_to_bucket = leaf_to_bucket
 
         domain = {
             k: _unpack(batch[k]).item()
@@ -568,37 +649,40 @@ class AutoregressivePredictorAdaptive:
                     and timestep_idx > 0
                     and timestep_idx % self.regrid_interval == 0
                 ):
-                    curr_by_level, leaf_to_bucket, centers, meta = self._regrid_native(
+                    with self._time_phase("time_adaptive_regrid"):
+                        curr_by_level, leaf_to_bucket, centers, meta = self._regrid_native(
+                            curr_by_level,
+                            leaf_to_bucket,
+                            meta,
+                        )
+
+                with self._time_phase("time_adaptive_forward"):
+                    pred_by_level = self.model.forward_multi_scale(
                         curr_by_level,
                         leaf_to_bucket,
-                        meta,
-                    )
+                        centers,
+                    )  # {lvl: (N_l, C, R, H_l, W_l)}
 
-                pred_by_level = self.model.forward_multi_scale(
-                    curr_by_level,
-                    leaf_to_bucket,
-                    centers,
-                )  # {lvl: (N_l, C, R, H_l, W_l)}
+                with self._time_phase("time_adaptive_post"):
+                    if self.pred_mode == "residual":
+                        # Add last input frame per level (broadcast across R output frames).
+                        for lvl in pred_by_level:
+                            pred_by_level[lvl] = pred_by_level[lvl] + curr_by_level[lvl][:, :, -1:]
 
-                if self.pred_mode == "residual":
-                    # Add last input frame per level (broadcast across R output frames).
-                    for lvl in pred_by_level:
-                        pred_by_level[lvl] = pred_by_level[lvl] + curr_by_level[lvl][:, :, -1:]
-
-                # Inverse transform & store per-timestep.
-                for t in range(steps_this_call):
-                    step_pred = {}
-                    for lvl, arr in pred_by_level.items():
-                        slice_np = arr[:, :, t : t + 1].cpu().numpy()  # (N_l, C, 1, H_l, W_l)
-                        if hasattr(self.transform, "inverse_transform") and callable(
-                            self.transform.inverse_transform
-                        ):
-                            slice_np = self.transform.inverse_transform(slice_np)
-                        step_pred[lvl] = slice_np
-                    all_preds_by_level.append(step_pred)
-                    all_leaf_to_bucket.append(leaf_to_bucket.cpu().numpy())
-                    all_centers.append(meta["centers"])
-                    all_levels.append(meta["levels"])
+                    # Inverse transform & store per-timestep.
+                    for t in range(steps_this_call):
+                        step_pred = {}
+                        for lvl, arr in pred_by_level.items():
+                            slice_np = arr[:, :, t : t + 1].cpu().numpy()  # (N_l, C, 1, H_l, W_l)
+                            if hasattr(self.transform, "inverse_transform") and callable(
+                                self.transform.inverse_transform
+                            ):
+                                slice_np = self.transform.inverse_transform(slice_np)
+                            step_pred[lvl] = slice_np
+                        all_preds_by_level.append(step_pred)
+                        all_leaf_to_bucket.append(leaf_to_bucket.cpu().numpy())
+                        all_centers.append(meta["centers"])
+                        all_levels.append(meta["levels"])
 
                 # Autoregressive feeding per level: slide T_in window, append R-frame prediction.
                 if call_idx < self.num_forward_calls - 1:
@@ -631,7 +715,6 @@ class AutoregressivePredictorAdaptive:
             "levels_list": np.empty(1, dtype=object),
             "ref_centers": np.expand_dims(ref_meta["centers"], 0),
             "ref_levels": np.expand_dims(ref_meta["levels"], 0),
-            "ref_leaf_to_bucket": np.expand_dims(leaf_to_bucket.cpu().numpy(), 0),
         }
 
         # Pack GT per-level as object array.
@@ -661,7 +744,7 @@ class AutoregressivePredictorAdaptive:
 
         if self.regrid_profiler is not None:
             self.regrid_profiler.write(self.regrid_out_dir, self.regrid_backend)
-        return out_dict
+        return self._format_output(out_dict, batch, leaf_to_bucket=ref_leaf_to_bucket)
 
     def _regrid_native(self, curr_by_level, leaf_to_bucket, meta):
         """Regrid native-mode predictions: exact refine/coarsen via native quadtree.
@@ -684,7 +767,8 @@ class AutoregressivePredictorAdaptive:
                 break
 
         # Move to numpy for the shared regrid function.
-        np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in curr_by_level.items()}
+        original_by_level = transform_regrid_values(self.transform, curr_by_level, inverse=True)
+        np_by_level = {lvl: arr.cpu().numpy() for lvl, arr in original_by_level.items()}
         l2b_np = leaf_to_bucket.cpu().numpy()
 
         new_by_level_np, new_l2b, new_meta = regrid_native_dispatch(
@@ -702,6 +786,7 @@ class AutoregressivePredictorAdaptive:
             allow_coarsening=self.allow_coarsening,
         )
 
+        new_by_level_np = transform_regrid_values(self.transform, new_by_level_np, inverse=False)
         # Move back to torch.
         new_by_level = {
             lvl: torch.from_numpy(arr).to(self.device, dtype=torch.float32)
@@ -724,6 +809,10 @@ class MetricEvaluator:
       1. target_src (numpy array) — NPZ mode with return_src=True
       2. target_src_paths (file paths) — AMReX mode with return_src=True
       3. Fallback: reference grid target from the predictor output
+
+    Reference targets are reused only for matching ordered geometry (and native
+    bucket layout); otherwise they are projected onto the prediction mesh.
+    Uniform reference patches cannot recover fine detail discarded by sampling.
     """
 
     def __init__(self, config: dict):
@@ -831,47 +920,31 @@ class MetricEvaluator:
 
                 step_meta = {"centers": step_centers, "levels": step_levels, "domain": domain}
                 N_step = pred_phys.shape[0]
-                c_out, _, ph, pw = pred_phys.shape[1:]
 
                 # --- GT assignment: pick best available source ---
                 t_gt = time.perf_counter()
                 gt_arr = None  # will be set if quadtree-based GT is built
-                if targets_src is not None:
-                    gt_src_frame = targets_src[step]  # (C, H, W) dense
-                    step_qt = tensor_to_quadtree(
-                        np.zeros((N_step, c_out, ph, pw), dtype=np.float32),
+                if has_any_src:
+                    gt_arr, _ = build_uniform_gt(
+                        pred_phys[:, :, 0],
                         step_meta,
+                        gt_src_frame=targets_src[step] if targets_src is not None else None,
+                        gt_src_path=(
+                            target_src_paths[step]
+                            if targets_src is None and target_src_paths is not None else None
+                        ),
+                        amrex_field_names=self.amrex_field_names,
+                        amrex_patch_size=self.amrex_patch_size,
                         cell_scale_mode=self.cell_scale_mode,
                     )
-                    step_qt.assign_from_array(gt_src_frame)
-                    gt_arr, _ = quadtree_to_tensor(
-                        step_qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                    )  # (N_step, C, Ph, Pw)
-                    target_eval = gt_arr[
-                        :, :, np.newaxis
-                    ]  # (N_step, C, 1, Ph, Pw) — match pred shape
-                elif target_src_paths is not None:
-                    from wamrvit.quad.amrex_to_qt import assign_from_amrex
-
-                    step_qt = tensor_to_quadtree(
-                        np.zeros((N_step, c_out, ph, pw), dtype=np.float32),
-                        step_meta,
-                        cell_scale_mode=self.cell_scale_mode,
-                    )
-                    assign_from_amrex(
-                        step_qt,
-                        target_src_paths[step],
-                        self.amrex_field_names,
-                        patch_size=self.amrex_patch_size,
-                    )
-                    gt_arr, _ = quadtree_to_tensor(
-                        step_qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                    )  # (N_step, C, Ph, Pw)
-                    target_eval = gt_arr[:, :, np.newaxis]
+                    target_eval = gt_arr[:, :, np.newaxis]  # (N_step, C, 1, Ph, Pw)
                 else:
                     target_ref = targets[b, :, :, step : step + 1]  # (N_ref, C, 1, Ph, Pw)
-                    if target_ref.shape[0] == N_step:
-                        # Prediction grid == reference grid — use directly.
+                    if (
+                        np.array_equal(step_centers, ref_centers)
+                        and np.array_equal(step_levels, ref_levels)
+                    ):
+                        # Direct reuse requires the same ordered spatial regions.
                         target_eval = target_ref
                     else:
                         # Grids differ: project ref → uniform → step-quadtree.
@@ -879,15 +952,10 @@ class MetricEvaluator:
                         gt_uniform = tensor_to_uniform(
                             gt_ref_frame, ref_meta, cell_scale_mode=self.cell_scale_mode
                         )  # (C, H, W)
-                        step_qt = tensor_to_quadtree(
-                            np.zeros((N_step, c_out, ph, pw), dtype=np.float32),
-                            step_meta,
+                        gt_arr, _ = build_uniform_gt(
+                            pred_phys[:, :, 0], step_meta, gt_src_frame=gt_uniform,
                             cell_scale_mode=self.cell_scale_mode,
                         )
-                        step_qt.assign_from_array(gt_uniform)
-                        gt_arr, _ = quadtree_to_tensor(
-                            step_qt, return_tensor=False, cell_scale_mode=self.cell_scale_mode
-                        )  # (N_step, C, Ph, Pw)
                         target_eval = gt_arr[:, :, np.newaxis]  # (N_step, C, 1, Ph, Pw)
                 # ------------------------------------------
                 t_gt_done = time.perf_counter()
@@ -1021,6 +1089,18 @@ class MetricEvaluator:
         }
         max_level_idx = int(domain["max_level_idx"])
 
+        if targets_src is None:
+            ref_centers = _unpack(batch["ref_centers"])
+            if ref_centers.ndim == 3:
+                ref_centers = ref_centers.squeeze(0)
+            ref_meta = {
+                "centers": ref_centers,
+                "levels": _unpack(batch["ref_levels"]).reshape(-1),
+                "domain": domain,
+            }
+            ref_l2b = _unpack(batch["ref_leaf_to_bucket"]).reshape(-1, 2)
+            gt_dict = _unpack(batch["gt_by_level"])
+
         first_pred = preds_by_level_list[0]
         C = next(v.shape[1] for v in first_pred.values() if v.shape[0] > 0)
 
@@ -1052,8 +1132,7 @@ class MetricEvaluator:
             step_levels = levels_list[step]  # (N,)
             step_meta = {"centers": step_centers, "levels": step_levels, "domain": domain}
 
-            # Build GT per-level buckets: either project dense src or use per-level targets.
-            gt_by_level = None
+            # Prefer dense GT; reference buckets must match both geometry and layout.
             gt_src_frame = None
             if targets_src is not None:
                 gt_src_frame = targets_src[step]  # (C, H, W)
@@ -1065,15 +1144,22 @@ class MetricEvaluator:
                     cell_scale_mode=self.cell_scale_mode,
                 )  # {lvl: (N_l, C, H_l, W_l)}
 
-            if gt_by_level is None:
-                gt_dict = _unpack(
-                    batch["gt_by_level"]
-                )  # {lvl: (N_l, C, T_out, H_l, W_l)} or (N_l, C, H_l, W_l)
-                gt_by_level = {}
-                for lvl, arr in gt_dict.items():
-                    gt_by_level[lvl] = (
-                        arr[:, :, step] if arr.ndim == 5 else arr
-                    )  # (N_l, C, H_l, W_l)
+            else:
+                gt_by_level = {
+                    lvl: arr[:, :, step] if arr.ndim == 5 else arr
+                    for lvl, arr in gt_dict.items()
+                }  # (N_l, C, H_l, W_l) on the reference mesh
+                if not (
+                    np.array_equal(step_centers, ref_meta["centers"])
+                    and np.array_equal(step_levels, ref_meta["levels"])
+                    and np.array_equal(step_l2b, ref_l2b)
+                ):
+                    # Native buckets retain the full-resolution reference field.
+                    gt_uniform = tensor_to_uniform_native(gt_by_level, ref_l2b, ref_meta)
+                    gt_by_level = build_native_gt_buckets(
+                        pred_by_level, step_l2b, step_meta, gt_uniform,
+                        cell_scale_mode=self.cell_scale_mode,
+                    )
 
             # Per-level + cell MSE metrics.
             eval_per_level_metrics(
@@ -1132,6 +1218,8 @@ def main():
     config["inference"]["model_name"] = model_name
 
     default_csv = f"rmse_adaptive_{model_name}_steps{steps}.csv"
+    if config["inference"].get("split_policy", "internal") != "prepartitioned":
+        default_csv = default_csv.removesuffix(".csv") + "_heldout.csv"
 
     csv_path = config["inference"].get("output_csv") or os.path.join("results", default_csv)
     if not os.path.isabs(csv_path):
@@ -1139,57 +1227,18 @@ def main():
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     config["inference"]["output_csv"] = csv_path
 
-    if not ray.is_initialized():
-        ray.init(
-            object_store_memory=config["inference"].get("ray_object_store_memory", 10)
-            * 1024
-            * 1024
-            * 1024
-        )
-
     data_config = config["data"]
     file_parser = instantiate_from_config(config["file_parser"])
     all_paths = file_parser(data_config["glob_pattern"])
 
-    # Make the window generator generalizable
-    window_config = dict(config["window_generator"])
-    window_config["params"]["return_seq_len"] = config["inference"].get("predict_steps", 1)
-    params = dict(window_config.get("params", {}))
-    params["file_path_list"] = all_paths
-    window_config["params"] = params
-
-    windows = instantiate_from_config(window_config)
-
-    split_idx = int(len(windows) * config["inference"].get("split_ratio", 0.8))
-    windows = windows[split_idx:]
-
-    if not args.eval_full:
-        # eval every "steps" steps to get a snapshot of performance across the rollout
-        windows = windows[::steps]
-        print(f"Evaluating every {steps} steps. Total evaluation samples: {len(windows)}")
-
-    if args.debug:
-        windows = windows[:100]
-
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            w["idx"] = i
-
-    total_samples = len(windows)
-
-    # 1. Group windows by trajectory ID
-    traj_to_indices = defaultdict(list)
-    for i, w in enumerate(windows):
-        if isinstance(w, dict):
-            w["idx"] = i  # Assign global index
-            t_id = w.get("traj_idx", 0)
-            traj_to_indices[t_id].append(i)
-
-    print(
-        f"Total samples in validation split: {total_samples}, "
-        f"Trajectories: {len(traj_to_indices)}\n"
+    windows = prepare_evaluation_windows(
+        all_paths, config, eval_full=args.eval_full, debug=args.debug,
     )
 
+    if not ray.is_initialized():
+        ray.init(
+            object_store_memory=config["inference"].get("ray_object_store_memory", 10) * 1024**3
+        )
     ds = ray.data.from_items(windows)
 
     # Instantiate file loader strictly from the config context
@@ -1264,7 +1313,7 @@ def main():
             "The evaluation dataset is empty! Check your glob pattern and debug split logic."
         )
 
-    mean_vals = df.mean(numeric_only=True)
+    mean_vals = mean_numeric_result_columns(df)
     rmse_series = np.sqrt(mean_vals)
 
     results_dict = {"Step": []}

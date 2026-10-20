@@ -1,0 +1,12 @@
+# @package _global_
+# Distinct mid-grid PLI ViT, patch [16, 8], fixed PF1.
+defaults:
+  - override /dataset: pli_regular
+  - override /mode: train
+
+model:
+  patch_size: [16, 8]
+  rope_scale: [50, 140]  # [W/min_patch, H/min_patch]
+
+general:
+  run_name: pli_regular_mid

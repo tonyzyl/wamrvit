@@ -1,0 +1,21 @@
+# @package _global_
+# Canonical corrected TRL native Conv3D/AdaLN/full-field recipe: widening cascade.
+defaults:
+  - trl_adaptive_train
+  - _self_
+
+model:
+  concat_mlp: True
+  multi_scale_patch: True
+  multi_scale_channel_mult: 2
+  level_conditioned_norm: True
+
+file_loader:
+  params:
+    value_storage: native
+
+train:
+  loss_mode: full_field
+
+general:
+  run_name: trl_native_fullfield

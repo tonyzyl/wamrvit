@@ -8,11 +8,11 @@ import time
 import numpy as np
 import torch
 
-from wamrvit.quad.array_regrid_uniform import (
+from wamrvit.quad.array_regrid.core import DetectorSpec, extract_latest_detectors
+from wamrvit.quad.array_regrid.uniform import (
     array_regrid_from_sequence, array_regrid_topology_from_detectors,
 )
 from wamrvit.quad.gpu_payload_replay import replay_payload
-from wamrvit.quad.regrid_lineage import DetectorSpec, extract_latest_detectors
 
 logger = logging.getLogger(__name__)
 

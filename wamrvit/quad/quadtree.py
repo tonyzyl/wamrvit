@@ -69,9 +69,9 @@ class QuadCell:
     each cell resolves its physical area at the same per-cell density.
 
     `is_boundary` is set by `Quadtree.mark_boundary_cells()` — those calls are
-    disabled in the active training/inference pipeline since the flag has no
-    consumers there. Re-enable explicitly if you need it for visualization
-    (`plot_quadtree_boundary`).
+    disabled in the active training/inference pipeline (commit 8cf61fd) since the
+    flag has no consumers there. Re-enable explicitly if you need it for
+    visualization (`plot_quadtree_boundary`).
     """
 
     cx: float
@@ -944,12 +944,20 @@ class Quadtree:
         return [leaves[i] for i in order_idx]
 
     def export_leaves(
-        self, order: str = "morton", cell_scale_mode: str | None = None, eps: float = 1e-12
+        self,
+        order: str = "morton",
+        cell_scale_mode: str | None = None,
+        eps: float = 1e-12,
+        *,
+        include_values: bool = True,
+        include_bounds: bool = False,
     ):
         """
         Export leaves.
         Values are [N, C, patch_h, patch_w] in uniform mode; skipped in native mode
-        (variable per-leaf size — use quadtree_to_tensor_native instead).
+        (variable per-leaf size — use quadtree_to_tensor_native instead) or when
+        ``include_values=False``. ``include_bounds=True`` additionally emits
+        ordered ``[xmin, xmax, ymin, ymax]`` rows for direct source sampling.
         If cell_scale_mode is provided, 'centers' will be [N, 3] containing normalized
         (cx_norm, cy_norm, s_norm). Otherwise, it defaults to [N, 4] (cx, cy, hx, hy).
         """
@@ -969,8 +977,9 @@ class Quadtree:
         levels = np.empty(N, dtype=np.int16)
         tiles = np.empty((N, 2), dtype=np.int16)
         xy_idx = np.empty((N, 3), dtype=np.int32)
-        # Skip flat values array in native mode — leaves have variable shape.
-        if C == 0 or self.value_storage == "native":
+        bounds = np.empty((N, 4), dtype=np.float64) if include_bounds else None
+        # Skip flat values when only ordered geometry is needed or in native mode.
+        if not include_values or C == 0 or self.value_storage == "native":
             values = None
         else:
             values = np.empty((N, C, Ph, Pw), dtype=np.float32)
@@ -1008,6 +1017,12 @@ class Quadtree:
                 centers[k, 0] = c.cx
                 centers[k, 1] = c.cy
                 centers[k, 2] = s_val
+
+            if bounds is not None:
+                bounds[k, 0] = c.cx - c.hx
+                bounds[k, 1] = c.cx + c.hx
+                bounds[k, 2] = c.cy - c.hy
+                bounds[k, 3] = c.cy + c.hy
 
             levels[k] = c.level_idx
             tiles[k, 0] = c.tile_ix
@@ -1055,7 +1070,7 @@ class Quadtree:
             # Apply in-place Numba normalization (centers-min) / L
             normalize_centers_jit(centers, self.xmin, self.ymin, cell_min, Lx, Ly, Lcell)
 
-        return {
+        result = {
             "ids": ids,
             "centers": centers,
             "levels": levels,
@@ -1063,6 +1078,9 @@ class Quadtree:
             "xy_idx": xy_idx,
             "values": values,
         }
+        if bounds is not None:
+            result["bounds"] = bounds
+        return result
 
     def project_values_from(
         self,
@@ -1284,45 +1302,124 @@ class TreeDiff:
         return int(self.ids.shape[0])
 
 
-def _decode_uids_with_params(
-    ids: np.ndarray, max_level_idx: int, nx_tiles: int, ny_tiles: int
-) -> np.ndarray:
-    ids_i = ids.astype(np.uint64)
-    XW = max_level_idx
-    YW = max_level_idx
-    LW = 6
-    TXW = _ceil_log2(nx_tiles)
-    TYW = _ceil_log2(ny_tiles)
+def export_refine_only_tree_diff(
+    diff: TreeDiff,
+    *,
+    cell_scale_mode: str = "level_idx",
+    include_bounds: bool = False,
+) -> dict[str, Any]:
+    """Export canonical leaf geometry without constructing Python tree objects.
 
-    u = ids_i.view(np.uint64)
-    shift = 0
-    x_mask = (np.uint64(1) << XW) - 1 if XW > 0 else np.uint64(0)
-    y_mask = (np.uint64(1) << YW) - 1 if YW > 0 else np.uint64(0)
-    l_mask = (np.uint64(1) << LW) - 1
-    tx_mask = (np.uint64(1) << TXW) - 1 if TXW > 0 else np.uint64(0)
-    ty_mask = (np.uint64(1) << TYW) - 1 if TYW > 0 else np.uint64(0)
+    ``TopologyBuilder`` computes AMReX training caches against a fully coarse
+    baseline. For a refine-only diff, every leaf in a refined root tile is in
+    ``diff.tuples``; unmentioned root tiles remain level-0 leaves. This compact
+    representation is sufficient to reproduce ``Quadtree.export_leaves``.
+    """
+    if cell_scale_mode != "level_idx":
+        raise ValueError(
+            "Direct TreeDiff geometry currently requires cell_scale_mode='level_idx'."
+        )
+    tuples = np.asarray(diff.tuples, dtype=np.int32)
+    ops = np.asarray(diff.ops) if diff.ops is not None else None
+    if ops is None or ops.shape != (tuples.shape[0],) or np.any(ops != 1):
+        raise ValueError("Direct TreeDiff geometry requires refine-only delta ops.")
+    if tuples.ndim != 2 or tuples.shape[1] != 5:
+        raise ValueError("TreeDiff tuples must have shape (N, 5).")
+    if len(tuples) and (
+        np.any(tuples[:, 2] <= 0) or np.any(tuples[:, 2] > diff.max_level_idx)
+    ):
+        raise ValueError("Refine-only TreeDiff rows must have levels in [1, max].")
 
-    x_idx = ((u >> shift) & x_mask) if XW > 0 else np.zeros_like(u)
-    shift += XW
-    y_idx = ((u >> shift) & y_mask) if YW > 0 else np.zeros_like(u)
-    shift += YW
-    level_idx = (u >> shift) & l_mask
-    shift += LW
-    tile_ix = ((u >> shift) & tx_mask) if TXW > 0 else np.zeros_like(u)
-    shift += TXW
-    tile_iy = ((u >> shift) & ty_mask) if TYW > 0 else np.zeros_like(u)
+    refined_tiles = {tuple(map(int, row[:2])) for row in tuples}
+    coarse_rows = [
+        (tile_x, tile_y, 0, 0, 0)
+        for tile_y in range(diff.ny_tiles)
+        for tile_x in range(diff.nx_tiles)
+        if (tile_x, tile_y) not in refined_tiles
+    ]
+    coarse = np.asarray(coarse_rows, dtype=np.int32).reshape(-1, 5)
+    leaves = np.concatenate([tuples, coarse], axis=0)
+    if not len(leaves):
+        raise ValueError("TreeDiff geometry produced no leaves.")
 
-    out = np.stack(
-        [
-            tile_ix.astype(np.int64),
-            tile_iy.astype(np.int64),
-            level_idx.astype(np.int64),
-            x_idx.astype(np.int64),
-            y_idx.astype(np.int64),
-        ],
-        axis=1,
-    ).astype(np.int32)
-    return out
+    fine_x = np.empty(len(leaves), dtype=np.int64)
+    fine_y = np.empty(len(leaves), dtype=np.int64)
+    bits = diff.max_level_idx + _ceil_log2(max(diff.nx_tiles, diff.ny_tiles))
+    for index, row in enumerate(leaves):
+        tile_x, tile_y, level, x_idx, y_idx = map(int, row)
+        scale_shift = diff.max_level_idx - level
+        fine_x[index] = (tile_x << diff.max_level_idx) | (x_idx << scale_shift)
+        fine_y[index] = (tile_y << diff.max_level_idx) | (y_idx << scale_shift)
+    order = np.asarray(
+        sorted(
+            range(len(leaves)),
+            key=lambda index: int(
+                morton2D_jit(int(fine_x[index]), int(fine_y[index]), bits=bits)
+            ),
+        ),
+        dtype=np.int64,
+    )
+    leaves = leaves[order]
+
+    tile_width = (diff.xmax - diff.xmin) / diff.nx_tiles
+    tile_height = (diff.ymax - diff.ymin) / diff.ny_tiles
+    levels = leaves[:, 2].astype(np.int16)
+    widths = tile_width / np.exp2(leaves[:, 2].astype(np.float64))
+    heights = tile_height / np.exp2(leaves[:, 2].astype(np.float64))
+    x_min = diff.xmin + leaves[:, 0] * tile_width + leaves[:, 3] * widths
+    y_min = diff.ymin + leaves[:, 1] * tile_height + leaves[:, 4] * heights
+
+    centers = np.empty((len(leaves), 3), dtype=np.float32)
+    centers[:, 0] = x_min + 0.5 * widths
+    centers[:, 1] = y_min + 0.5 * heights
+    centers[:, 2] = levels
+    normalize_centers_jit(
+        centers,
+        diff.xmin,
+        diff.ymin,
+        0.0,
+        diff.xmax - diff.xmin,
+        diff.ymax - diff.ymin,
+        1.0,
+    )
+
+    ids = np.empty(len(leaves), dtype=np.uint64)
+    x_width = diff.max_level_idx
+    y_width = diff.max_level_idx
+    level_width = 6
+    tile_x_width = _ceil_log2(diff.nx_tiles)
+    for index, row in enumerate(leaves):
+        tile_x, tile_y, level, x_idx, y_idx = map(int, row)
+        uid = int(x_idx) | (int(y_idx) << x_width)
+        uid |= int(level) << (x_width + y_width)
+        uid |= int(tile_x) << (x_width + y_width + level_width)
+        uid |= int(tile_y) << (
+            x_width + y_width + level_width + tile_x_width
+        )
+        ids[index] = uid
+
+    result: dict[str, Any] = {
+        "ids": ids,
+        "centers": centers,
+        "levels": levels,
+        "tiles": leaves[:, :2].astype(np.int16),
+        "xy_idx": leaves[:, 2:5].astype(np.int32),
+        "values": None,
+        "domain": {
+            "xmin": diff.xmin,
+            "xmax": diff.xmax,
+            "ymin": diff.ymin,
+            "ymax": diff.ymax,
+            "max_level_idx": diff.max_level_idx,
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+        },
+    }
+    if include_bounds:
+        result["bounds"] = np.column_stack(
+            [x_min, x_min + widths, y_min, y_min + heights]
+        ).astype(np.float64, copy=False)
+    return result
 
 
 def compute_tree_diff(tree_a: Quadtree, tree_b: Quadtree, include_values: bool = True) -> TreeDiff:

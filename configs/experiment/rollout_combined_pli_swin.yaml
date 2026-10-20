@@ -1,0 +1,9 @@
+# @package _global_
+# Raw PLI uniform-adaptive versus revised finest-grid Swin.
+defaults:
+  - rollout_combined_pli_uniform
+  - _self_
+
+inference:
+  checkpoint_path_regular: ${checkpoint_root}/pli_swin/model
+  output_csv: ${output_root}/rmse_combined_pli_swin.csv

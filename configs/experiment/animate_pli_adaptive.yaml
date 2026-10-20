@@ -1,0 +1,8 @@
+# @package _global_
+# Raw PLI uniform-adaptive animation with CPU eager array regridding.
+defaults:
+  - override /dataset: pli_adaptive
+  - override /mode: animate_pli
+
+inference:
+  checkpoint_path: ${checkpoint_root}/pli_adaptive/model

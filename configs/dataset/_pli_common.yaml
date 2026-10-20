@@ -1,0 +1,58 @@
+# @package _global_
+# Shared PLI source fields, evaluated fields and fixed index cadence.
+
+fields:
+  all:
+    - Uvelocity
+    - Wvelocity
+    - av_density
+    - energy_case
+    - energy_cushion
+    - energy_maincharge
+    - energy_outside_air
+    - energy_striker
+    - energy_throw
+    - vofm_case
+    - vofm_cushion
+    - vofm_maincharge
+    - vofm_outside_air
+    - vofm_striker
+    - vofm_throw
+  eval:
+    - Uvelocity
+    - Wvelocity
+    - av_density
+    - energy_case
+    - vofm_case
+    - vofm_cushion
+    - vofm_maincharge
+    - vofm_outside_air
+    - vofm_striker
+    - vofm_throw
+
+file_parser:
+  target: wamrvit.dataloader.selection.sources.multi_traj_under_single_dir_parser
+  params:
+    filename_pattern: &pli_filename_pattern '.*id(\d+).*idx(\d+).*\.npz'
+
+window_generator:
+  target: wamrvit.dataloader.selection.windows.generate_multi_trajectory_windows
+  params:
+    input_seq_len: 2
+    return_seq_len: 1
+    sampling_interval: 1
+    interval_between_pred: 1
+    # Enables gap detection: windows that cross missing frame indices are skipped.
+    filename_pattern: *pli_filename_pattern
+
+# Cache identity only; topology caching remains CLI opt-in.
+topology_store:
+  source_root: ${data_root}/oceans11_pli
+  dataset_id: pli
+
+data:
+  time:
+    source: index
+    step: 1.0
+  glob_pattern: ${data_paths.pli}
+  field_names: ${fields.eval}

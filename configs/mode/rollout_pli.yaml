@@ -1,0 +1,16 @@
+# @package _global_
+# PLI adaptive evaluation: CPU eager array payloads (uniform or native patches).
+defaults:
+  - rollout_pli_regular
+  - _self_
+
+file_loader:
+  params:
+    adapt_on_channels: [0, 1, 2]
+
+inference:
+  regrid_interval: 4
+  regrid_tol_frac: [0.1, 0.1, 0.3]
+  regrid_adapt_nearby: 2
+  regrid_backend: array
+  array_regrid_payload_backend: cpu_eager

@@ -1,0 +1,8 @@
+# @package _global_
+# Raw PLI uniform-adaptive Conv3D, fixed 2-to-1 history and PF1.
+defaults:
+  - override /dataset: pli_adaptive
+  - override /mode: train
+
+general:
+  run_name: pli_adaptive

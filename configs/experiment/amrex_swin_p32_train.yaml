@@ -1,0 +1,4 @@
+# @package _global_
+# Explicit p32 name for the canonical revised AMReX Swin recipe.
+defaults:
+  - amrex_swin_train

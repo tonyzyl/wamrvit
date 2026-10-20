@@ -1,0 +1,51 @@
+# @package _global_
+# AMReX uniform-patch adaptive Conv3D model, five quadtree levels.
+
+defaults:
+  - _amrex_common
+
+num_levels: 5
+cell_scale_mode: level_idx
+
+train:
+  source_provider:
+    target: wamrvit.dataloader.transport.amrex.AMReXSourceProvider
+  amrex_frame_cache_gib: 0
+  amrex_frame_cache_partial: false
+  amrex_frame_cache_usable_fraction: 0.95
+  amrex_frame_cache_estimate_padding_fraction: 0.02
+  amrex_frame_cache_normalize: false
+  amrex_frame_cache_build_concurrency: 2  # bounded; decoded frame caching is off by default
+
+model:
+  _class_name: QuadTreeTransformer
+  in_channels: 17
+  patch_size: 32
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  num_layers: 6
+  attention_head_dim: 192
+  num_attention_heads: 12
+  mlp_ratio: 1.0
+  rope_theta: 10000
+  rope_axes_dim: ${rope_axes_dim_adaptive:${model.attention_head_dim},${num_levels}}
+  rope_scale: [768, 128, 1]
+  eps: 1e-7
+  adaptive: True
+  cell_scale_mode: ${cell_scale_mode}
+  max_level_idx: ${sub:${num_levels},1}
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.AdaptiveLoader
+  params:
+    mode: amrex
+    field_names: ${fields.all}
+    amrex_patch_size: 32
+    cell_scale_mode: ${cell_scale_mode}
+    num_levels: ${num_levels}
+    adapt_on_channels: [0]  # HRR
+    adapt_nearby: 2
+    tol_frac: 0.01
+    value_storage: uniform
+    resample_coarsen_ratio: 0.0
+    resample_refine_ratio: 0.0

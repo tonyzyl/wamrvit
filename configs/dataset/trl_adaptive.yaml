@@ -1,0 +1,48 @@
+# @package _global_
+# TRL uniform-patch adaptive Conv3D model, three quadtree levels.
+
+defaults:
+  - _trl_common
+
+num_levels: 3
+cell_scale_mode: level_idx
+
+model:
+  _class_name: QuadTreeTransformer
+  in_channels: 4
+  patch_size: [4, 4]                # finest patch — matches trl_regular_train.yaml
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  num_layers: 6
+  attention_head_dim: 192
+  num_attention_heads: 12
+  mlp_ratio: 1.0
+  rope_theta: 10000
+  rope_axes_dim: ${rope_axes_dim_adaptive:${model.attention_head_dim},${num_levels}}
+  rope_scale: [96, 32, 1]            # [W/min_patch, H/min_patch, level] = [384/4, 128/4, 1]
+  eps: 1e-7
+  adaptive: True
+  cell_scale_mode: ${cell_scale_mode}
+  max_level_idx: ${sub:${num_levels},1}
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.AdaptiveLoader
+  params:
+    mode: hdf5
+    cell_scale_mode: ${cell_scale_mode}
+    num_levels: ${num_levels}
+    tile_width: 16
+    tile_height: 16
+    adapt_nearby: 2
+    tol_frac: [0.1, 0.1, 0.1, 0.1]  # per-channel tolerance fraction for adaptivity
+    adapt_on_channels: [0, 1, 2, 3]
+    value_storage: uniform
+    resample_coarsen_ratio: 0.0
+    resample_refine_ratio: 0.0
+    scalar_fields:
+      density: [t0_fields, density]
+      pressure: [t0_fields, pressure]
+    vector_fields:
+      velocity_x: [t1_fields, velocity, 0]
+      velocity_y: [t1_fields, velocity, 1]
+    field_order: ${fields.all}

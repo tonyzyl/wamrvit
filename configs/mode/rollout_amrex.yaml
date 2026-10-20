@@ -1,0 +1,34 @@
+# @package _global_
+# AMReX PF4 evaluation, fixed cadence, shared training-source membership.
+train:
+  split_ratio: 0.8
+  num_push_forward_steps: 4
+
+inference:
+  predict_steps: 20
+  regrid_interval: 4
+  regrid_tol_frac: [0.01]
+  regrid_adapt_nearby: 2
+  # Uniform CUDA payload replay with detector-only CPU topology.
+  # Capacity/unsupported-operation failures retain the existing object fallback.
+  # Reference override: inference.regrid_backend=object (or cpu_eager payloads).
+  regrid_backend: array
+  array_regrid_value_storage: source
+  array_regrid_payload_backend: gpu_replay
+  array_regrid_capacity: 8192
+  array_regrid_num_threads: 24
+  pred_mode: target
+  metrics: [RMSE, VRMSE]
+  checkpoint_path: null  # select an experiment or override on the CLI
+  output_csv: null
+  split_policy: internal
+  eval_start_stride: null
+  include_eval_tail: true
+  require_unseen_inputs: true
+  compute_uniform_metrics: False
+  mapper_concurrency: 1
+  eval_concurrency: 1
+  mapper_memory_gb: 10
+  predictor_memory_gb: 15
+  eval_memory_gb: 6
+  eval_verbose: True

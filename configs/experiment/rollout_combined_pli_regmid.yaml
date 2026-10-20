@@ -1,0 +1,9 @@
+# @package _global_
+# Raw PLI uniform-adaptive versus the distinct mid-grid ViT, patch [16, 8].
+defaults:
+  - rollout_combined_pli_uniform
+  - _self_
+
+inference:
+  checkpoint_path_regular: ${checkpoint_root}/pli_regular_mid/model
+  output_csv: ${output_root}/rmse_combined_pli_regmid.csv

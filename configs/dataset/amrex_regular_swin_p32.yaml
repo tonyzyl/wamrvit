@@ -1,0 +1,32 @@
+# @package _global_
+# Canonical revised AMReX Swin: p32 on simulation level 2 (1024 x 6144).
+# Token grid is 32 x 192 (6144 tokens), matching the paper's regular ViT.
+
+defaults:
+  - _amrex_common
+
+model:
+  _class_name: SwinV2Transformer
+  in_channels: 17
+  patch_size: [32, 32]
+  patch_size_t: ${window_generator.params.input_seq_len}
+  return_seq_len: ${window_generator.params.return_seq_len}
+  swin_embed_dim: 192
+  swin_depths: [8, 12, 12, 6]   # same backbone recipe as swin_mid
+  swin_num_heads: [6, 12, 24, 48]
+  swin_window_size: 8
+  swin_pretrained: False
+  img_size: [1024, 6144]    # (H, W) — sim level 2 projection
+  decoder_channels: 256
+  decoder_refinement_blocks: 2
+  adaptive: False
+
+file_loader:
+  target: wamrvit.dataloader.payload.loaders.YTAmReXRegularLoader
+  params:
+    field_names: ${fields.all}
+    domain_from: domain
+    target_level: 2
+
+data:
+  domain_from: domain

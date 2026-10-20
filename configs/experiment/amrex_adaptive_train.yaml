@@ -1,0 +1,32 @@
+# @package _global_
+# AMReX uniform-adaptive Conv3D, fixed 2-to-1 history and PF4.
+# Requires --cache_topology and a high-memory allocation; Ray carries descriptors,
+# while rank-local threads export bounded payloads from cached decoded frames.
+defaults:
+  - override /dataset: amrex_adaptive
+  - override /mode: train
+  - override /env: hpc
+
+train:
+  payload_transport: worker_stream
+  ray_stream_object_store_memory_gib: 420
+  ray_stream_node_headroom_gib: 128
+  streaming_loader_backend: thread
+  streaming_prefetch_batches: 3
+  streaming_memory_budget_gib_per_rank: 24
+  streaming_overlap_staging: false
+  amrex_frame_cache_gib: 350
+  amrex_frame_cache_partial: false
+  amrex_frame_cache_normalize: true
+  amrex_frame_cache_build_concurrency: 16
+  amrex_direct_export: true
+  amrex_direct_pin_output: true
+  amrex_direct_topology_geometry: true
+  amrex_direct_raster_sampler: true
+  num_train_epochs: 600
+  save_every_epochs: 1000
+  num_push_forward_steps: 4
+
+general:
+  run_name: amrex_adaptive
+  ray_object_store_memory: 420

@@ -2,7 +2,7 @@ import numpy as np
 import ray
 import yt
 import json
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 state_vars = [
     'HRR', 'T', 'mach', 'pressure', 'rho', 'rhoE', 'rhoUx', 'rhoUy', 

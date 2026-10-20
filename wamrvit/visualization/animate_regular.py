@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from wamrvit.dataloader.trajectory_loader import Seq2SeqMapper
-from wamrvit.quad.yt_utils import make_regular_centers
-from wamrvit.quadtree_transformer import QuadTreeTransformer
+from wamrvit.checkpoint import load_model
+from wamrvit.dataloader.payload.mappers import Seq2SeqMapper
+from wamrvit.quad.quad_utils import make_regular_centers
 from wamrvit.utils import instantiate_from_config, load_config
 from wamrvit.visualization import anim_style
 from wamrvit.visualization.plotting import compute_vrange
@@ -207,7 +207,7 @@ def main():
     if "file_loader" in config:
         file_loader = instantiate_from_config(config["file_loader"])
     else:
-        from wamrvit.dataloader.loader import YTAmReXRegularLoader
+        from wamrvit.dataloader.payload.loaders import YTAmReXRegularLoader
 
         fallback_fields = data_config.get("field_names", data_config.get("fields"))
         file_loader = YTAmReXRegularLoader(
@@ -226,32 +226,7 @@ def main():
     # --- 4. LOAD MODEL ---
     inf_cfg = config["inference"]
 
-    # When loading via diffusers, read _class_name from the checkpoint's
-    # config.json so the YAML model block doesn't need to stay in sync.
-    model_class_name = config["model"].get("_class_name", "QuadTreeTransformer")
-    if inf_cfg.get("is_diffusers", False):
-        import json
-
-        ckpt_config_path = os.path.join(inf_cfg["checkpoint_path"], "config.json")
-        if os.path.exists(ckpt_config_path):
-            with open(ckpt_config_path) as f:
-                model_class_name = json.load(f).get("_class_name", model_class_name)
-
-    if model_class_name == "SwinV2Transformer":
-        from wamrvit.swin_transformer import SwinV2Transformer
-
-        model_cls = SwinV2Transformer
-    else:
-        model_cls = QuadTreeTransformer
-
-    if inf_cfg.get("is_diffusers", False):
-        model = model_cls.from_pretrained(inf_cfg["checkpoint_path"])
-    else:
-        model = model_cls(**config["model"])
-        state_dict = torch.load(inf_cfg["checkpoint_path"], map_location="cpu")
-        if "module." in list(state_dict.keys())[0]:
-            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict)
+    model = load_model(inf_cfg["checkpoint_path"], config["model"])
 
     model.to(device)
     model.eval()
