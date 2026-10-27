@@ -132,6 +132,10 @@ Combined recipes use `inference.checkpoint_path_adaptive` and `inference.checkpo
 }
 ```
 
+## Acknowledgments
+
+This work was supported by Los Alamos National Laboratory through the project “Algorithm/Software/Hardware Co-design for High Energy Density Applications” at the University of Michigan, and by the Center for Prediction, Reasoning, and Intelligence for Multiphysics Exploration (C-PRIME), a PSAAP-IV project funded by the U.S. Department of Energy under Grant No. DE-NA0004264.
+
 ## License
 
 WAMRViT-original code is MIT-licensed; see `LICENSE`. NeuralOperator loss attribution is retained in `wamrvit/loss.py` under the same MIT terms. The Well-derived metrics retain their BSD-3-Clause notice in the header of `wamrvit/rollout/regular_metrics.py`.
