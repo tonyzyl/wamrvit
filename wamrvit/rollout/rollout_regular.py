@@ -17,19 +17,25 @@ from wamrvit.utils import instantiate_from_config, load_config
 
 
 class AutoregressivePredictor:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, model=None, device=None, transform=None):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         inf_cfg = config["inference"]
 
-        self.model = load_model(inf_cfg["checkpoint_path"], config["model"])
+        self.model = model if model is not None else load_model(
+            inf_cfg["checkpoint_path"], config["model"]
+        )
 
         self.model.to(self.device)
         self.model.eval()
 
         # Use the same config-driven transform pattern as training/adaptive rollout.
-        self.transform = instantiate_from_config(config["transform"])
+        self.transform = transform if transform is not None else instantiate_from_config(
+            config["transform"]
+        )
 
         self.predict_steps = inf_cfg.get("predict_steps", 1)
         self.model_return_seq_len = self.model.config.return_seq_len
@@ -40,9 +46,10 @@ class AutoregressivePredictor:
         inputs = torch.from_numpy(batch["input"]).to(
             self.device, dtype=torch.float32
         )  # (B, C, T_in, H, W)
-        targets = torch.from_numpy(batch["target"]).to(
-            self.device, dtype=torch.float32
-        )  # (B, C, T_out, H, W)
+        targets = (
+            torch.from_numpy(batch["target"]).to(self.device, dtype=torch.float32)
+            if "target" in batch else None
+        )  # Optional comparison data, never an inference input.
 
         B, C, T_in, H, W = inputs.shape
         centers = make_regular_centers(
@@ -66,24 +73,14 @@ class AutoregressivePredictor:
                     pred_full = pred_full + curr_input_seq[:, :, -1].unsqueeze(2)  # (B, C, R, H, W)
 
                 pred_to_store = pred_full[:, :, :steps_this_call]  # (B, C, steps_this_call, H, W)
-                gt = targets[
-                    :, :, timestep_idx : timestep_idx + steps_this_call
-                ]  # (B, C, steps_this_call, H, W)
                 pred_np = pred_to_store.cpu().numpy()
-                gt_np = gt.cpu().numpy()
 
-                # Inverse transform outputs back to physical space
-                if hasattr(self.transform, "inverse_transform") and callable(
-                    self.transform.inverse_transform
-                ):
-                    pred_phys = self.transform.inverse_transform(pred_np)
-                    gt_phys = self.transform.inverse_transform(gt_np)
-                else:
-                    pred_phys = pred_np
-                    gt_phys = gt_np
-
-                all_preds.append(pred_phys)
-                all_gts.append(gt_phys)
+                # Inverse transform outputs back to physical space.
+                inverse = getattr(self.transform, "inverse_transform", None)
+                all_preds.append(inverse(pred_np) if callable(inverse) else pred_np)
+                if targets is not None:
+                    gt_np = targets[:, :, timestep_idx : timestep_idx + steps_this_call].cpu().numpy()
+                    all_gts.append(inverse(gt_np) if callable(inverse) else gt_np)
 
                 if call_idx < self.num_forward_calls - 1:
                     # Slide window: keep last (T_in - R) input frames, append the full R-frame pred.
@@ -96,9 +93,9 @@ class AutoregressivePredictor:
                         curr_input_seq = pred_full[:, :, -T_in:]  # (B, C, T_in, H, W)
 
         pred_full = np.concatenate(all_preds, axis=2)  # (B, C, predict_steps, H, W)
-        gt_full = np.concatenate(all_gts, axis=2)  # (B, C, predict_steps, H, W)
-
-        out_dict = {"pred": pred_full, "target": gt_full}
+        out_dict = {"pred": pred_full}
+        if targets is not None:
+            out_dict["target"] = np.concatenate(all_gts, axis=2)
         if "idx" in batch:
             out_dict["idx"] = batch["idx"]
         if "traj_idx" in batch:

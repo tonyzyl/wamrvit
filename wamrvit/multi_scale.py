@@ -258,8 +258,10 @@ def unpack_multi_scale_batch(
     num_levels: int,
     device: torch.device,
     non_blocking: bool = False,
+    *,
+    include_targets: bool = True,
 ):
-    """Pull per-level input/target columns out of a Ray batch dict for rollout.
+    """Pull per-level inputs and optional comparison targets from a rollout batch.
 
     Accepts three encodings of the leading batch=1 dimension:
       - torch.Tensor of shape (1, N_l, ...) — Ray Train's torch DataLoader.
@@ -283,7 +285,8 @@ def unpack_multi_scale_batch(
     targets_by_level: dict[int, torch.Tensor] = {}
     for lvl in range(num_levels):
         values_by_level[lvl] = _strip_batch(batch[f"input_level_{lvl}"])
-        targets_by_level[lvl] = _strip_batch(batch[f"target_level_{lvl}"])
+        if include_targets:
+            targets_by_level[lvl] = _strip_batch(batch[f"target_level_{lvl}"])
 
     leaf_to_bucket = _strip_batch(batch["leaf_to_bucket"]).long()
     centers = _strip_batch(batch["centers"])

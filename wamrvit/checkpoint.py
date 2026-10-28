@@ -1,6 +1,7 @@
 """Load local forecasting checkpoints without coupling callers to their format."""
 
 import json
+import logging
 import os
 import warnings
 from collections.abc import Mapping
@@ -8,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 def _model_class(name: str):
@@ -38,7 +41,7 @@ def load_model(path: str | os.PathLike[str], model_cfg: Mapping[str, Any]):
         if config_path.is_file():
             with config_path.open(encoding="utf-8") as handle:
                 name = json.load(handle).get("_class_name", name)
-        print(f"Loading {name} via diffusers from: {path}")
+        logger.info("Loading %s via diffusers from: %s", name, path)
         return _model_class(name).from_pretrained(path)
 
     model_cls = _model_class(name)
@@ -50,7 +53,7 @@ def load_model(path: str | os.PathLike[str], model_cfg: Mapping[str, Any]):
             UserWarning,
             stacklevel=2,
         )
-    print(f"Loading {name} state dict from: {path}")
+    logger.info("Loading %s state dict from: %s", name, path)
     model = model_cls(**model_kwargs)
     state = torch.load(path, map_location="cpu", weights_only=True)
     model.load_state_dict({key.removeprefix("module."): value for key, value in state.items()})

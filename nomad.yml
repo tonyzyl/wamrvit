@@ -1,0 +1,23 @@
+# All normalized PLI checkpoints currently published in the collection.
+# The pin includes the approved model cards; WAMRVIT_HF_REVISION can override it.
+tool_manager:
+  enabled: true
+  idle_seconds: 120
+  gc_idle_seconds: 300
+  disk_idle_seconds: 600
+  max_pending_per_tool: 8
+telemetry:
+  enabled: false
+fmod_models:
+  - model_class: wamrvit.integrations.nomad.PLIForecastTool
+    name_or_path: "hf://tonyzyl/Oceans11-PLI-collection@${WAMRVIT_HF_REVISION:f995d326fc3c029f78553efe6fd858b1d8fdc0fd}#pli_1k_conv3D_normalized_wamrvit_ms"
+    tool_name: pli-ms-2to1-1k
+    batch_size: 1
+  - model_class: wamrvit.integrations.nomad.PLIForecastTool
+    name_or_path: "hf://tonyzyl/Oceans11-PLI-collection@${WAMRVIT_HF_REVISION:f995d326fc3c029f78553efe6fd858b1d8fdc0fd}#pli_1k_conv3D_normalized_vit_finest"
+    tool_name: pli-vit-2to1-1k
+    batch_size: 1
+  - model_class: wamrvit.integrations.nomad.PLIForecastTool
+    name_or_path: "hf://tonyzyl/Oceans11-PLI-collection@${WAMRVIT_HF_REVISION:f995d326fc3c029f78553efe6fd858b1d8fdc0fd}#pli_full_1to1_conv3D_normalized_vit_finest"
+    tool_name: pli-vit-1to1-full
+    batch_size: 1

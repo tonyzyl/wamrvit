@@ -1,4 +1,5 @@
 import argparse
+import logging
 import math
 import os
 import time
@@ -38,6 +39,8 @@ from wamrvit.rollout.regular_metrics import (
     mean_numeric_result_columns,
 )
 from wamrvit.utils import instantiate_from_config, load_config
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared helpers for metric evaluation
@@ -247,19 +250,28 @@ def eval_native_uniform_metrics(
 
 
 class AutoregressivePredictorAdaptive:
-    def __init__(self, config: dict, *, checkpoint_key: str = "checkpoint_path"):
+    def __init__(
+        self, config: dict, *, checkpoint_key: str = "checkpoint_path",
+        model=None, device=None, transform=None,
+    ):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device is not None else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         inf_cfg = config["inference"]
-        self.model = load_model(inf_cfg[checkpoint_key], config["model"])
+        self.model = model if model is not None else load_model(
+            inf_cfg[checkpoint_key], config["model"]
+        )
         self.multi_scale = getattr(self.model.config, "multi_scale_patch", False)
         self.num_levels = int(self.model.config.max_level_idx) + 1 if self.multi_scale else 0
 
         self.model.to(self.device)
         self.model.eval()
 
-        self.transform = instantiate_from_config(config["transform"])
+        self.transform = transform if transform is not None else instantiate_from_config(
+            config["transform"]
+        )
 
         self.predict_steps = inf_cfg.get("predict_steps", 1)
         self.model_return_seq_len = self.model.config.return_seq_len
@@ -300,7 +312,7 @@ class AutoregressivePredictorAdaptive:
         self.array_regrid_num_threads = inf_cfg.get("array_regrid_num_threads")
         if self.regrid_backend == "array":
             configure_array_regrid_num_threads(self.array_regrid_num_threads)
-            print(
+            logger.info(
                 "Array regrid runtime: "
                 f"value_storage={self.array_regrid_value_storage}, "
                 f"payload_backend={self.array_regrid_payload_backend}, "
@@ -606,6 +618,7 @@ class AutoregressivePredictorAdaptive:
             self.num_levels,
             self.device,
             non_blocking=False,
+            include_targets=any(f"target_level_{level}" in batch for level in range(self.num_levels)),
         )
         ref_leaf_to_bucket = leaf_to_bucket
 
@@ -717,9 +730,10 @@ class AutoregressivePredictorAdaptive:
             "ref_levels": np.expand_dims(ref_meta["levels"], 0),
         }
 
-        # Pack GT per-level as object array.
-        out_dict["gt_by_level"] = np.empty(1, dtype=object)
-        out_dict["gt_by_level"][0] = gt_by_level
+        # Comparison targets are optional for target-free serving.
+        if targets_by_level:
+            out_dict["gt_by_level"] = np.empty(1, dtype=object)
+            out_dict["gt_by_level"][0] = gt_by_level
 
         if target_src_np is not None:
             # target_src is (..., T, C, H, W) — different layout from pred/gt,

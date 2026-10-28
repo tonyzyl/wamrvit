@@ -114,6 +114,10 @@ uv run wamrvit/rollout/rollout_adaptive.py +experiment=rollout_pli_adaptive infe
 
 Combined recipes use `inference.checkpoint_path_adaptive` and `inference.checkpoint_path_regular`. Keep source ground truth (GT) enabled (`file_loader.params.return_src=true`) for correct regridded evaluation. Preserve the configured held-out cohort; `--eval_full` changes the evaluation protocol.
 
+## Nomad integration
+
+Install the optional connector with `uv sync --extra nomad`, then serve the three published PLI checkpoints using `uv run --extra nomad nomad serve nomad.yml`. See [the integration guide](docs/nomad.md) for field layouts, typed client examples and validation status.
+
 ## Layout
 
 `train.py`: training · `configs/`: recipes · `wamrvit/`: models, data pipelines, regridding, rollout, and visualization.

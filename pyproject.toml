@@ -26,6 +26,12 @@ dependencies = [
     "pytest",
 ]
 
+[project.optional-dependencies]
+nomad = [
+    "nomad-scifm==0.2.1",
+    "diffusers==0.37.1",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
